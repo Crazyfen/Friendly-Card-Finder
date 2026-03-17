@@ -4,6 +4,7 @@ import (
 	"FriendlyCardFinder/env"
 	"FriendlyCardFinder/internal/deckbox"
 	"FriendlyCardFinder/internal/dto"
+	"context"
 	"database/sql"
 	"fmt"
 	"log/slog"
@@ -116,10 +117,10 @@ func (s *SQLiteStorage) Close() error {
 	return firstErr
 }
 
-func (s *SQLiteStorage) RegisterUser(user deckbox.BotUser) error {
+func (s *SQLiteStorage) RegisterUser(ctx context.Context, user deckbox.BotUser) error {
 	const op = "storage.sqlite.RegisterUser"
 
-	stmt, err := s.db.writeDB.Prepare(`
+	stmt, err := s.db.writeDB.PrepareContext(ctx, `
 	INSERT INTO users(telegramId, username, deckboxLogin)
 	VALUES (?, ?, ?) 
 	`)
@@ -136,10 +137,10 @@ func (s *SQLiteStorage) RegisterUser(user deckbox.BotUser) error {
 	return nil
 }
 
-func (s *SQLiteStorage) SaveDeckboxUser(user deckbox.DeckboxUser) error {
+func (s *SQLiteStorage) SaveDeckboxUser(ctx context.Context, user deckbox.DeckboxUser) error {
 	const op = "storage.sqlite.SaveDeckboxUser"
 
-	stmt, err := s.db.writeDB.Prepare(`
+	stmt, err := s.db.writeDB.PrepareContext(ctx, `
 	INSERT OR IGNORE INTO deckbox_users(deckboxLogin, inventoryId, tradelistId, wishlistId)
 	VALUES (?, ?, ?, ?);`)
 	if err != nil {
@@ -152,7 +153,7 @@ func (s *SQLiteStorage) SaveDeckboxUser(user deckbox.DeckboxUser) error {
 		return fmt.Errorf("%s: %w", op, err)
 	}
 
-	stmt, err = s.db.writeDB.Prepare(`UPDATE deckbox_users
+	stmt, err = s.db.writeDB.PrepareContext(ctx, `UPDATE deckbox_users
 	SET inventoryId = ?, tradelistId = ?, wishlistId = ?
 	WHERE deckboxLogin = ?
 	`)
@@ -169,10 +170,10 @@ func (s *SQLiteStorage) SaveDeckboxUser(user deckbox.DeckboxUser) error {
 	return nil
 }
 
-func (s *SQLiteStorage) UpdateDeckboxUserTimestamp(deckboxLogin string, updatedAt int64) error {
+func (s *SQLiteStorage) UpdateDeckboxUserTimestamp(ctx context.Context, deckboxLogin string, updatedAt int64) error {
 	const op = "storage.sqlite.UpdateDeckboxUserTimestamp"
 
-	stmt, err := s.db.writeDB.Prepare(`
+	stmt, err := s.db.writeDB.PrepareContext(ctx, `
 	UPDATE deckbox_users
 	SET updated_at = ?
 	WHERE deckboxLogin = ?
@@ -190,10 +191,10 @@ func (s *SQLiteStorage) UpdateDeckboxUserTimestamp(deckboxLogin string, updatedA
 	return nil
 }
 
-func (s *SQLiteStorage) GetDeckboxUser(deckboxLogin string) (*deckbox.DeckboxUser, error) {
+func (s *SQLiteStorage) GetDeckboxUser(ctx context.Context, deckboxLogin string) (*deckbox.DeckboxUser, error) {
 	const op = "storage.sqlite.GetDeckboxUser"
 
-	stmt, err := s.db.readDB.Prepare(`
+	stmt, err := s.db.readDB.PrepareContext(ctx, `
 	SELECT deckboxLogin, inventoryId, tradelistId, wishlistId, updated_at
 	FROM deckbox_users
 	WHERE deckboxLogin = ?
@@ -225,10 +226,10 @@ func (s *SQLiteStorage) GetDeckboxUser(deckboxLogin string) (*deckbox.DeckboxUse
 	}, nil
 }
 
-func (s *SQLiteStorage) GetAllDeckboxUsersWithOldLists(thresholdSeconds int64) ([]string, error) {
+func (s *SQLiteStorage) GetAllDeckboxUsersWithOldLists(ctx context.Context, thresholdSeconds int64) ([]string, error) {
 	const op = "storage.sqlite.GetAllDeckboxUsersWithOldLists"
 
-	stmt, err := s.db.readDB.Prepare(`
+	stmt, err := s.db.readDB.PrepareContext(ctx, `
 	SELECT deckboxLogin FROM deckbox_users
 	WHERE updated_at IS NULL OR updated_at < ?
 	`)
@@ -259,11 +260,11 @@ func (s *SQLiteStorage) GetAllDeckboxUsersWithOldLists(thresholdSeconds int64) (
 	return logins, nil
 }
 
-func (s *SQLiteStorage) SaveCardList(list deckbox.CardList) error {
+func (s *SQLiteStorage) SaveCardList(ctx context.Context, list deckbox.CardList) error {
 	const op = "storage.sqlite.SaveCardList"
 	log := slog.Default()
 
-	err := s.ClearCardList(list.ListId)
+	err := s.ClearCardList(ctx, list.ListId)
 	if err != nil {
 		return fmt.Errorf("%s: %w", op, err)
 	}
@@ -286,7 +287,7 @@ func (s *SQLiteStorage) SaveCardList(list deckbox.CardList) error {
 	}
 
 	// Begin transaction
-	tx, err := s.db.writeDB.Begin()
+	tx, err := s.db.writeDB.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("%s: %w", op, err)
 	}
@@ -336,7 +337,7 @@ func (s *SQLiteStorage) SaveCardList(list deckbox.CardList) error {
 		VALUES %s
 		`, strings.Join(valueStrings, ", "))
 
-		stmt, err := tx.Prepare(query)
+		stmt, err := tx.PrepareContext(ctx, query)
 		if err != nil {
 			log.Error(
 				"failed to prepare batch statement",
@@ -368,7 +369,7 @@ func (s *SQLiteStorage) SaveCardList(list deckbox.CardList) error {
 			VALUES %s
 			`, strings.Join(ftsValueStrings, ", "))
 
-			ftsStmt, err := tx.Prepare(ftsQuery)
+			ftsStmt, err := tx.PrepareContext(ctx, ftsQuery)
 			if err != nil {
 				log.Error(
 					"failed to prepare fts batch statement",
@@ -413,10 +414,10 @@ func (s *SQLiteStorage) SaveCardList(list deckbox.CardList) error {
 	return nil
 }
 
-func (s *SQLiteStorage) ClearCardList(listId int64) error {
+func (s *SQLiteStorage) ClearCardList(ctx context.Context, listId int64) error {
 	const op = "storage.sqlite.ClearCardList"
 
-	stmt, err := s.db.writeDB.Prepare(`
+	stmt, err := s.db.writeDB.PrepareContext(ctx, `
 	DELETE FROM card_lists
 	WHERE listId = ?
 	`)
@@ -436,64 +437,66 @@ func (s *SQLiteStorage) ClearCardList(listId int64) error {
 	return nil
 }
 
-func (s *SQLiteStorage) SearchCard(cardName string, scope string) ([]dto.CardSearchDTO, error) {
+func (s *SQLiteStorage) SearchCard(ctx context.Context, cardName string, scope string) ([]dto.CardSearchDTO, error) {
 	const op = "storage.sqlite.SearchCard"
 
 	// determine which deckbox_users column to join on based on scope
 	column := "tradelistId"
 	switch scope {
-	case "wishlist":
+	case deckbox.ScopeWishlist:
 		column = "wishlistId"
-	case "inventory":
+	case deckbox.ScopeInventory:
 		column = "inventoryId"
 	}
 
 	var rows *sql.Rows
 
-	// Prefer FTS5 based search for better performance and tokenized prefix matching
+	// Prefer FTS5 based search for better performance and tokenized prefix matching.
+	// Fall back to LIKE when FTS is disabled or the query reduces to no tokens
+	// (e.g. an all-punctuation input like "//"), so callers always get LIKE semantics.
 	if s.ftsEnabled {
 		matchQuery := buildFtsQueryTerm(cardName)
-		if matchQuery == "" {
-			return nil, nil
-		}
+		if matchQuery != "" {
+			// Match against normalized column to support accent-insensitive matching
+			sqlStmt := fmt.Sprintf(`
+			SELECT cl.listId, cl.cardName COLLATE NOCASE, cl.quantity
+			FROM card_lists AS cl
+			JOIN card_lists_fts AS fts ON cl.listId = fts.listId AND cl.cardName = fts.cardName
+			JOIN deckbox_users AS du ON cl.listId = du.%s
+			WHERE fts.cardName_normalized MATCH ?
+			ORDER BY cl.listId ASC, cl.cardName ASC
+			`, column)
 
-		// Match against normalized column to support accent-insensitive matching
-		sqlStmt := fmt.Sprintf(`
-		SELECT cl.listId, cl.cardName COLLATE NOCASE, cl.quantity
-		FROM card_lists AS cl
-		JOIN card_lists_fts AS fts ON cl.listId = fts.listId AND cl.cardName = fts.cardName
-		JOIN deckbox_users AS du ON cl.listId = du.%s
-		WHERE fts.cardName_normalized MATCH ?
-		ORDER BY cl.listId ASC, cl.cardName ASC
-		`, column)
+			stmt, err := s.db.readDB.PrepareContext(ctx, sqlStmt)
+			if err != nil {
+				return nil, fmt.Errorf("%s: %w", op, err)
+			}
+			defer stmt.Close()
 
-		stmt, err := s.db.readDB.Prepare(sqlStmt)
-		if err != nil {
-			// fall back to LIKE search if FTS isn't usable at runtime
-			return nil, fmt.Errorf("%s: %w", op, err)
+			rows, err = stmt.QueryContext(ctx, matchQuery)
+			if err != nil {
+				return nil, fmt.Errorf("%s: %w", op, err)
+			}
 		}
-		defer stmt.Close()
+		// matchQuery == "" means all-punctuation input — fall through to LIKE below
+	}
 
-		rows, err = stmt.Query(matchQuery)
-		if err != nil {
-			return nil, fmt.Errorf("%s: %w", op, err)
-		}
-	} else {
+	if rows == nil {
 		sqlStmt := fmt.Sprintf(`
 		SELECT cl.listId, cl.cardName COLLATE NOCASE, cl.quantity
 		FROM card_lists AS cl
 		LEFT JOIN deckbox_users AS du ON cl.listId = du.%s
-		WHERE du.deckboxLogin IS NOT NULL AND cl.cardName LIKE ? 
+		WHERE du.deckboxLogin IS NOT NULL AND cl.cardName LIKE ?
 		ORDER BY cl.listId ASC, cl.cardName ASC
 		`, column)
 
-		stmt, err := s.db.readDB.Prepare(sqlStmt)
+		stmt, err := s.db.readDB.PrepareContext(ctx, sqlStmt)
 		if err != nil {
 			return nil, fmt.Errorf("%s: %w", op, err)
 		}
 		defer stmt.Close()
 
-		rows, err = stmt.Query("%" + cardName + "%")
+		rows, err = stmt.QueryContext(ctx, "%"+cardName+"%")
 		if err != nil {
 			return nil, fmt.Errorf("%s: %w", op, err)
 		}
@@ -524,10 +527,10 @@ func (s *SQLiteStorage) SearchCard(cardName string, scope string) ([]dto.CardSea
 	return results, nil
 }
 
-func (s *SQLiteStorage) GetOwnerByListId(listId int64) (*deckbox.CardListOwnerInfo, error) {
+func (s *SQLiteStorage) GetOwnerByListId(ctx context.Context, listId int64) (*deckbox.CardListOwnerInfo, error) {
 	const op = "storage.sqlite.GetOwnerByListId"
 
-	stmt, err := s.db.readDB.Prepare(`
+	stmt, err := s.db.readDB.PrepareContext(ctx, `
 	SELECT du.deckboxLogin, u.telegramId, u.username
 	FROM deckbox_users AS du
 	LEFT JOIN users AS u ON du.deckboxLogin = u.deckboxLogin

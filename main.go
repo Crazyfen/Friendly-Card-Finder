@@ -107,13 +107,13 @@ func defaultHandler(ctx context.Context, b *bot.Bot, update *models.Update) {
 		line = strings.TrimSpace(line)
 		log.Info("card to search", slog.String("line", line))
 
-		result, err := deckbox.SearchCard(log, ctx.Value(storageKey).(deckbox.DeckboxSaver), line, deckbox.ScopeTradelist)
+		result, err := deckbox.SearchCard(ctx, log, ctx.Value(storageKey).(deckbox.DeckboxSaver), line, deckbox.ScopeTradelist)
 		if err != nil {
 			log.Error("failed to search card", sl.Err(err))
 			continue
 		}
 
-		message := result.FormatForTelegram(ctx.Value(storageKey).(deckbox.DeckboxSaver), lang, deckbox.ScopeTradelist)
+		message := result.FormatForTelegram(ctx, ctx.Value(storageKey).(deckbox.DeckboxSaver), lang, deckbox.ScopeTradelist)
 		log.Info("sending card search response", slog.String("message", message))
 
 		if len(message) > 4096 {
@@ -177,7 +177,7 @@ func deckboxHandler(ctx context.Context, b *bot.Bot, update *models.Update) {
 
 	scraper := ctx.Value(scraperKey).(*deckbox.Scraper)
 	lang := i18n.DetectLang(update.Message.From.LanguageCode)
-	response := deckbox.NewUser(log, ctx.Value(storageKey).(deckbox.DeckboxSaver), scraper, update.Message, lang)
+	response := deckbox.NewUser(ctx, log, ctx.Value(storageKey).(deckbox.DeckboxSaver), scraper, update.Message, lang)
 
 	_, err := b.SendMessage(ctx, &bot.SendMessageParams{
 		ChatID: update.Message.Chat.ID,
@@ -280,13 +280,13 @@ func sellHandler(ctx context.Context, b *bot.Bot, update *models.Update) {
 			continue
 		}
 
-		result, err := deckbox.SearchCard(log, ctx.Value(storageKey).(deckbox.DeckboxSaver), line, deckbox.ScopeWishlist)
+		result, err := deckbox.SearchCard(ctx, log, ctx.Value(storageKey).(deckbox.DeckboxSaver), line, deckbox.ScopeWishlist)
 		if err != nil {
 			log.Error("failed to search card", sl.Err(err))
 			continue
 		}
 
-		message := result.FormatForTelegram(ctx.Value(storageKey).(deckbox.DeckboxSaver), lang, deckbox.ScopeWishlist)
+		message := result.FormatForTelegram(ctx, ctx.Value(storageKey).(deckbox.DeckboxSaver), lang, deckbox.ScopeWishlist)
 
 		if len(message) > 4096 {
 			parts := splitMessage(message, 4096)

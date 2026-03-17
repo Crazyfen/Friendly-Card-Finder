@@ -3,6 +3,7 @@ package deckbox
 import (
 	"FriendlyCardFinder/internal/dto"
 	"FriendlyCardFinder/internal/i18n"
+	"context"
 	b64 "encoding/base64"
 	"fmt"
 	"log/slog"
@@ -57,15 +58,15 @@ const (
 
 // DeckboxSaver defines the interface for storage operations
 type DeckboxSaver interface {
-	RegisterUser(user BotUser) error
-	SaveDeckboxUser(user DeckboxUser) error
-	SaveCardList(list CardList) error
-	ClearCardList(listId int64) error
-	SearchCard(cardName string, scope string) ([]dto.CardSearchDTO, error)
-	GetOwnerByListId(listId int64) (*CardListOwnerInfo, error)
-	GetDeckboxUser(deckboxLogin string) (*DeckboxUser, error)
-	UpdateDeckboxUserTimestamp(deckboxLogin string, updatedAt int64) error
-	GetAllDeckboxUsersWithOldLists(thresholdSeconds int64) ([]string, error)
+	RegisterUser(ctx context.Context, user BotUser) error
+	SaveDeckboxUser(ctx context.Context, user DeckboxUser) error
+	SaveCardList(ctx context.Context, list CardList) error
+	ClearCardList(ctx context.Context, listId int64) error
+	SearchCard(ctx context.Context, cardName string, scope string) ([]dto.CardSearchDTO, error)
+	GetOwnerByListId(ctx context.Context, listId int64) (*CardListOwnerInfo, error)
+	GetDeckboxUser(ctx context.Context, deckboxLogin string) (*DeckboxUser, error)
+	UpdateDeckboxUserTimestamp(ctx context.Context, deckboxLogin string, updatedAt int64) error
+	GetAllDeckboxUsersWithOldLists(ctx context.Context, thresholdSeconds int64) ([]string, error)
 }
 
 // Scraper handles fetching data from Deckbox with embedded configuration
@@ -82,7 +83,7 @@ func NewScraper(log *slog.Logger, sessionCookie string) *Scraper {
 	}
 }
 
-func (scr *SearchCardResult) FormatForTelegram(storage DeckboxSaver, lang string, scope string) string {
+func (scr *SearchCardResult) FormatForTelegram(ctx context.Context, storage DeckboxSaver, lang string, scope string) string {
 	// Select i18n keys based on scope
 	noResultsKey := "search.no_results"
 	resultsHeaderKey := "search.results_header"
@@ -100,7 +101,7 @@ func (scr *SearchCardResult) FormatForTelegram(storage DeckboxSaver, lang string
 
 	for _, cl := range scr.SearchResults {
 		// Get owner info for this list
-		ownerInfo, err := storage.GetOwnerByListId(cl.ListId)
+		ownerInfo, err := storage.GetOwnerByListId(ctx, cl.ListId)
 		if err == nil {
 			// Format deckbox login with link to tradelist
 			uEnc := b64.URLEncoding.EncodeToString([]byte(scr.SearchQuery))

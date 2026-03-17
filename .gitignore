@@ -17,6 +17,7 @@
 # IDE/editor files
 .vscode/
 .idea/
+.claude/
 *.iml
 
 # OS generated files
@@ -37,6 +38,7 @@ mem.out
 *~
 
 # SQLite database (if ever added to repo root)
+storage/*
 *.db
 
 # Go workspace file (if used)

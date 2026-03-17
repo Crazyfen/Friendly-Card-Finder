@@ -1,9 +1,9 @@
 package deckbox
 
 import (
-	"context"
 	"FriendlyCardFinder/internal/i18n"
 	"FriendlyCardFinder/internal/lib/logger/sl"
+	"context"
 	"fmt"
 	"log/slog"
 	"strconv"
@@ -14,7 +14,7 @@ import (
 	"github.com/go-telegram/bot/models"
 )
 
-func NewUser(log *slog.Logger, storage DeckboxSaver, scraper *Scraper, message *models.Message, lang string) string {
+func NewUser(ctx context.Context, log *slog.Logger, storage DeckboxSaver, scraper *Scraper, message *models.Message, lang string) string {
 	const op = "handlers.deckbox.NewUser"
 	log = log.With(slog.String("operation", op), slog.String("message_id", strconv.Itoa(message.ID)))
 
@@ -26,7 +26,7 @@ func NewUser(log *slog.Logger, storage DeckboxSaver, scraper *Scraper, message *
 
 	log.Info("registering user", slog.String("username", message.From.Username), slog.String("deckbox_id", argument))
 
-	err := storage.RegisterUser(BotUser{
+	err := storage.RegisterUser(ctx, BotUser{
 		TelegramID:       message.From.ID,
 		TelegramUsername: message.From.Username,
 		DeckboxLogin:     argument,
@@ -64,7 +64,7 @@ func GetProfileData(ctx context.Context, log *slog.Logger, storage DeckboxSaver,
 	}
 
 	// Process userData and update storage
-	err = storage.SaveDeckboxUser(user)
+	err = storage.SaveDeckboxUser(ctx, user)
 	if err != nil {
 		log.Error("failed to update user", sl.Err(err))
 		return
@@ -102,7 +102,7 @@ func UpdateCardList(ctx context.Context, log *slog.Logger, storage DeckboxSaver,
 	}
 
 	// Save the card list to storage
-	err = storage.SaveCardList(cardList)
+	err = storage.SaveCardList(ctx, cardList)
 	if err != nil {
 		log.Error("failed to save card list", sl.Err(err))
 		return
@@ -129,7 +129,7 @@ func refreshUserListsWorker(ctx context.Context, log *slog.Logger, storage Deckb
 		return 0, fmt.Sprintf("failed to fetch profile: %v", err)
 	}
 
-	err = storage.SaveDeckboxUser(user)
+	err = storage.SaveDeckboxUser(ctx, user)
 	if err != nil {
 		log.Error("failed to save deckbox user", sl.Err(err))
 		return 0, fmt.Sprintf("failed to save user: %v", err)
@@ -141,7 +141,7 @@ func refreshUserListsWorker(ctx context.Context, log *slog.Logger, storage Deckb
 		cardList, err := scraper.FetchCardList(ctx, *user.InventoryID)
 		if err != nil {
 			log.Error("failed to fetch inventory", sl.Err(err))
-		} else if err = storage.SaveCardList(cardList); err != nil {
+		} else if err = storage.SaveCardList(ctx, cardList); err != nil {
 			log.Error("failed to save inventory", sl.Err(err))
 		} else {
 			totalCards += len(cardList.Cards)
@@ -152,7 +152,7 @@ func refreshUserListsWorker(ctx context.Context, log *slog.Logger, storage Deckb
 		cardList, err := scraper.FetchCardList(ctx, *user.TradelistID)
 		if err != nil {
 			log.Error("failed to fetch tradelist", sl.Err(err))
-		} else if err = storage.SaveCardList(cardList); err != nil {
+		} else if err = storage.SaveCardList(ctx, cardList); err != nil {
 			log.Error("failed to save tradelist", sl.Err(err))
 		} else {
 			totalCards += len(cardList.Cards)
@@ -163,7 +163,7 @@ func refreshUserListsWorker(ctx context.Context, log *slog.Logger, storage Deckb
 		cardList, err := scraper.FetchCardList(ctx, *user.WishlistID)
 		if err != nil {
 			log.Error("failed to fetch wishlist", sl.Err(err))
-		} else if err = storage.SaveCardList(cardList); err != nil {
+		} else if err = storage.SaveCardList(ctx, cardList); err != nil {
 			log.Error("failed to save wishlist", sl.Err(err))
 		} else {
 			totalCards += len(cardList.Cards)
@@ -172,7 +172,7 @@ func refreshUserListsWorker(ctx context.Context, log *slog.Logger, storage Deckb
 
 	// Update timestamp only if card list saves succeeded
 	if totalCards > 0 {
-		err = storage.UpdateDeckboxUserTimestamp(login, time.Now().Unix())
+		err = storage.UpdateDeckboxUserTimestamp(ctx, login, time.Now().Unix())
 		if err != nil {
 			log.Error("failed to update timestamp", sl.Err(err))
 			return 0, fmt.Sprintf("failed to update timestamp: %v", err)
@@ -185,7 +185,7 @@ func refreshUserListsWorker(ctx context.Context, log *slog.Logger, storage Deckb
 	return totalCards, ""
 }
 
-func runUserRefreshWorkerPool(ctx context.Context, log *slog.Logger, storage DeckboxSaver, scraper profileFetcher, logins []string, numWorkers int, shouldProcessFn func(login string) bool) []struct {
+func runUserRefreshWorkerPool(ctx context.Context, log *slog.Logger, storage DeckboxSaver, scraper profileFetcher, logins []string, numWorkers int) []struct {
 	login string
 	cards int
 	err   string
@@ -212,17 +212,6 @@ func runUserRefreshWorkerPool(ctx context.Context, log *slog.Logger, storage Dec
 						return
 					}
 					workerLog := log.With(slog.String("deckbox_id", login), slog.Int("worker_id", workerID))
-
-					// Check if we should process this login (freshness check for SuggestDeckbox, always true for RefreshStaleUserLists)
-					if !shouldProcessFn(login) {
-						results <- struct {
-							login string
-							cards int
-							err   string
-						}{login: login, cards: 0, err: ""}
-						continue
-					}
-
 					cards, errStr := refreshUserListsWorker(ctx, workerLog, storage, scraper, login)
 					results <- struct {
 						login string
@@ -260,12 +249,12 @@ func runUserRefreshWorkerPool(ctx context.Context, log *slog.Logger, storage Dec
 	return collectedResults
 }
 
-func RefreshStaleUserLists(ctx context.Context, log *slog.Logger, storage DeckboxSaver, scraper *Scraper, refreshHours int) {
+func RefreshStaleUserLists(ctx context.Context, log *slog.Logger, storage DeckboxSaver, scraper profileFetcher, refreshHours int) {
 	const op = "handlers.deckbox.RefreshStaleUserLists"
 	log = log.With(slog.String("operation", op))
 
 	thresholdTime := time.Now().Add(-time.Duration(refreshHours) * time.Hour).Unix()
-	staleLogins, err := storage.GetAllDeckboxUsersWithOldLists(thresholdTime)
+	staleLogins, err := storage.GetAllDeckboxUsersWithOldLists(ctx, thresholdTime)
 	if err != nil {
 		log.Error("failed to get stale users", sl.Err(err))
 		return
@@ -278,19 +267,21 @@ func RefreshStaleUserLists(ctx context.Context, log *slog.Logger, storage Deckbo
 
 	log.Info("starting refresh of stale user lists", slog.Int("user_count", len(staleLogins)))
 
-	// Always process all stale users
-	runUserRefreshWorkerPool(ctx, log, storage, scraper, staleLogins, 10, func(login string) bool {
-		return true
-	})
+	collectedResults := runUserRefreshWorkerPool(ctx, log, storage, scraper, staleLogins, 10)
+	for _, res := range collectedResults {
+		if res.err != "" {
+			log.Error("failed to refresh user", slog.String("deckbox_id", res.login), slog.String("error", res.err))
+		}
+	}
 
 	log.Info("completed refresh of stale user lists")
 }
 
-func SearchCard(log *slog.Logger, storage DeckboxSaver, cardName string, scope string) (SearchCardResult, error) {
+func SearchCard(ctx context.Context, log *slog.Logger, storage DeckboxSaver, cardName string, scope string) (SearchCardResult, error) {
 	const op = "handlers.deckbox.SearchCard"
 	log = log.With(slog.String("operation", op), slog.String("card_name", cardName), slog.String("scope", scope))
 
-	results, err := storage.SearchCard(cardName, scope)
+	results, err := storage.SearchCard(ctx, cardName, scope)
 	if err != nil {
 		log.Error("failed to search card", sl.Err(err))
 		return SearchCardResult{}, err
@@ -345,7 +336,7 @@ type SuggestDeckboxResult struct {
 	Errors         []string
 }
 
-func SuggestDeckbox(ctx context.Context, log *slog.Logger, storage DeckboxSaver, scraper *Scraper, logins []string, freshnessHours int) SuggestDeckboxResult {
+func SuggestDeckbox(ctx context.Context, log *slog.Logger, storage DeckboxSaver, scraper profileFetcher, logins []string, freshnessHours int) SuggestDeckboxResult {
 	const op = "handlers.deckbox.SuggestDeckbox"
 	log = log.With(slog.String("operation", op))
 
@@ -359,29 +350,34 @@ func SuggestDeckbox(ctx context.Context, log *slog.Logger, storage DeckboxSaver,
 
 	log.Info("starting suggest deckbox refresh", slog.Int("user_count", len(logins)))
 
-	// shouldProcessFn checks freshness
-	shouldProcess := func(login string) bool {
-		existingUser, err := storage.GetDeckboxUser(login)
+	// Pre-filter: freshness checks are cheap (one DB read each) and serial access
+	// avoids races on result.Errors / result.SkippedCount inside worker goroutines.
+	freshnessLimit := time.Duration(freshnessHours) * time.Hour
+	toProcess := make([]string, 0, len(logins))
+	for _, login := range logins {
+		login = strings.TrimSpace(login)
+		existingUser, err := storage.GetDeckboxUser(ctx, login)
 		if err != nil {
 			log.Error("failed to get existing user", sl.Err(err))
 			result.Errors = append(result.Errors, fmt.Sprintf("failed to check existing user: %v", err))
-			return false
+			continue
 		}
-
 		if existingUser != nil && existingUser.UpdatedAt != nil {
 			timeSinceLast := time.Since(time.Unix(*existingUser.UpdatedAt, 0))
-			freshnessLimit := time.Duration(freshnessHours) * time.Hour
 			if timeSinceLast < freshnessLimit {
 				log.With(slog.String("deckbox_id", login)).Info("skipping, data too fresh", slog.Duration("time_since_update", timeSinceLast), slog.Duration("freshness_limit", freshnessLimit))
 				result.SkippedCount++
-				return false
+				continue
 			}
 		}
-
-		return true
+		toProcess = append(toProcess, login)
 	}
 
-	collectedResults := runUserRefreshWorkerPool(ctx, log, storage, scraper, logins, 5, shouldProcess)
+	if len(toProcess) == 0 {
+		return result
+	}
+
+	collectedResults := runUserRefreshWorkerPool(ctx, log, storage, scraper, toProcess, 5)
 
 	for _, res := range collectedResults {
 		if res.err != "" {
