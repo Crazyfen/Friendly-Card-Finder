@@ -1,0 +1,8 @@
+.env
+.env.*
+storage/
+FriendlyCardFinder
+.git/
+.github/
+.vscode/
+*.md

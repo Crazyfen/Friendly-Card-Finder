@@ -1,0 +1,7 @@
+services:
+  bot:
+    image: ghcr.io/Crazyfen/friendlycardfinder:latest
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      - ./storage:/app/storage
