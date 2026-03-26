@@ -143,20 +143,6 @@ func (cl *CardList) AddCard(cardName string, quantity int16) {
 	}
 }
 
-var shouldBeEscaped = "_*[]()~`>#+-=|{}.!"
-
-// EscapeMarkdown escapes special symbols for Telegram MarkdownV2 syntax
-func escapeMarkdown(s string) string {
-	var result []rune
-	for _, r := range s {
-		if strings.ContainsRune(shouldBeEscaped, r) {
-			result = append(result, '\\')
-		}
-		result = append(result, r)
-	}
-	return string(result)
-}
-
 // NewCommandArguments extracts arguments from a command message
 func NewCommandArguments(m *models.Message) string {
 	if len(m.Entities) == 0 {

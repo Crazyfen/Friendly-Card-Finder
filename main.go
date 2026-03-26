@@ -24,6 +24,7 @@ const (
 	logKey     contextKey = "log"
 	storageKey contextKey = "storage"
 	scraperKey contextKey = "scraper"
+	configKey  contextKey = "config"
 	envLocal              = "local"
 	envDev                = "dev"
 	envProd               = "prod"
@@ -40,7 +41,7 @@ func main() {
 
 	storage, err := sqlite.New(cfg.StoragePath)
 	if err != nil {
-		log.Error("failed to initialize storage: %v", sl.Err(err))
+		log.Error("failed to initialize storage", sl.Err(err))
 		os.Exit(1)
 	}
 	defer func() {
@@ -54,7 +55,7 @@ func main() {
 	ctx = context.WithValue(ctx, logKey, log)
 	ctx = context.WithValue(ctx, storageKey, storage)
 	ctx = context.WithValue(ctx, scraperKey, scraper)
-	ctx = context.WithValue(ctx, "config", cfg)
+	ctx = context.WithValue(ctx, configKey, cfg)
 
 	opts := []bot.Option{
 		bot.WithDefaultHandler(defaultHandler),
@@ -62,7 +63,7 @@ func main() {
 
 	b, err := bot.New(cfg.BotToken, opts...)
 	if err != nil {
-		log.Error("failed to create bot: %v", sl.Err(err))
+		log.Error("failed to create bot", sl.Err(err))
 		os.Exit(1)
 	}
 
@@ -71,7 +72,7 @@ func main() {
 	b.RegisterHandler(bot.HandlerTypeMessageText, "deckbox", bot.MatchTypeCommandStartOnly, deckboxHandler)
 	b.RegisterHandler(bot.HandlerTypeMessageText, "suggestdeckbox", bot.MatchTypeCommandStartOnly, suggestdeckboxHandler)
 
-	log.Info("starting bot", slog.String("token", b.Token()))
+	log.Info("starting bot")
 	b.Start(ctx)
 }
 
@@ -97,7 +98,7 @@ func defaultHandler(ctx context.Context, b *bot.Bot, update *models.Update) {
 	log.With(slog.String("operation", op), slog.String("message_id", strconv.Itoa(update.Message.ID))).Info("handling default message")
 
 	// Refresh stale user lists before searching
-	config := ctx.Value("config").(*config.Config)
+	config := ctx.Value(configKey).(*config.Config)
 	deckbox.RefreshStaleUserLists(ctx, log, ctx.Value(storageKey).(deckbox.DeckboxSaver), ctx.Value(scraperKey).(*deckbox.Scraper), config.CardListRefreshHours)
 
 	// Detect language from user
@@ -118,8 +119,7 @@ func defaultHandler(ctx context.Context, b *bot.Bot, update *models.Update) {
 
 		if len(message) > 4096 {
 			parts := splitMessage(message, 4096)
-			partsReplyTo := []int{len(parts)}
-			partsReplyTo[0] = int(update.Message.ID)
+			partsReplyTo := []int{int(update.Message.ID)}
 			for i, p := range parts {
 				reply, err := b.SendMessage(ctx, &bot.SendMessageParams{
 					ChatID:    update.Message.Chat.ID,
@@ -193,7 +193,7 @@ func suggestdeckboxHandler(ctx context.Context, b *bot.Bot, update *models.Updat
 	log := ctx.Value(logKey).(*slog.Logger)
 	log.With(slog.String("operation", op), slog.String("message_id", strconv.Itoa(update.Message.ID))).Info("handling /suggestdeckbox command")
 
-	cfg := ctx.Value("config").(*config.Config)
+	cfg := ctx.Value(configKey).(*config.Config)
 	scraper := ctx.Value(scraperKey).(*deckbox.Scraper)
 	storage := ctx.Value(storageKey).(deckbox.DeckboxSaver)
 
@@ -271,7 +271,7 @@ func sellHandler(ctx context.Context, b *bot.Bot, update *models.Update) {
 	}
 
 	// Refresh stale user lists before searching
-	config := ctx.Value("config").(*config.Config)
+	config := ctx.Value(configKey).(*config.Config)
 	deckbox.RefreshStaleUserLists(ctx, log, ctx.Value(storageKey).(deckbox.DeckboxSaver), ctx.Value(scraperKey).(*deckbox.Scraper), config.CardListRefreshHours)
 
 	for l := range strings.SplitSeq(argument, "\n") {
@@ -290,8 +290,7 @@ func sellHandler(ctx context.Context, b *bot.Bot, update *models.Update) {
 
 		if len(message) > 4096 {
 			parts := splitMessage(message, 4096)
-			partsReplyTo := []int{len(parts)}
-			partsReplyTo[0] = int(update.Message.ID)
+			partsReplyTo := []int{int(update.Message.ID)}
 			for i, p := range parts {
 				reply, err := b.SendMessage(ctx, &bot.SendMessageParams{
 					ChatID:    update.Message.Chat.ID,
