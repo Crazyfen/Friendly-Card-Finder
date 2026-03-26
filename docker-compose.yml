@@ -1,6 +1,6 @@
 services:
   bot:
-    image: ghcr.io/сrazyfen/friendlycardfinder:latest
+    image: ghcr.io/crazyfen/friendlycardfinder:latest
     restart: unless-stopped
     env_file: .env
     volumes:
