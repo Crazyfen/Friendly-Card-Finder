@@ -10,7 +10,7 @@ RUN go mod download
 
 COPY . .
 
-RUN CGO_ENABLED=1 go build -tags "fts5" -o bot ./...
+RUN CGO_ENABLED=1 go build -tags "fts5" -o bot .
 
 # Stage 2: runtime
 FROM alpine:latest
