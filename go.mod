@@ -8,6 +8,7 @@ require (
 	github.com/go-telegram/bot v1.18.0
 	github.com/gocolly/colly v1.2.0
 	github.com/mattn/go-sqlite3 v1.14.34
+	github.com/pressly/goose/v3 v3.27.0
 	golang.org/x/text v0.34.0
 )
 
@@ -21,9 +22,13 @@ require (
 	github.com/golang/groupcache v0.0.0-20241129210726-2c02b8208cf8 // indirect
 	github.com/golang/protobuf v1.5.4 // indirect
 	github.com/kennygrant/sanitize v1.2.4 // indirect
+	github.com/mfridman/interpolate v0.0.2 // indirect
 	github.com/saintfish/chardet v0.0.0-20230101081208-5e3ef4b5456d // indirect
+	github.com/sethvargo/go-retry v0.3.0 // indirect
 	github.com/temoto/robotstxt v1.1.2 // indirect
+	go.uber.org/multierr v1.11.0 // indirect
 	golang.org/x/net v0.50.0 // indirect
+	golang.org/x/sync v0.19.0 // indirect
 	google.golang.org/appengine v1.6.8 // indirect
 	google.golang.org/protobuf v1.36.11 // indirect
 )

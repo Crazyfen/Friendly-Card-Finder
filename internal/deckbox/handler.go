@@ -185,17 +185,15 @@ func refreshUserListsWorker(ctx context.Context, log *slog.Logger, storage Deckb
 	return totalCards, ""
 }
 
-func runUserRefreshWorkerPool(ctx context.Context, log *slog.Logger, storage DeckboxSaver, scraper profileFetcher, logins []string, numWorkers int) []struct {
+type refreshResult struct {
 	login string
 	cards int
 	err   string
-} {
+}
+
+func runUserRefreshWorkerPool(ctx context.Context, log *slog.Logger, storage DeckboxSaver, scraper profileFetcher, logins []string, numWorkers int) []refreshResult {
 	jobs := make(chan string, len(logins))
-	results := make(chan struct {
-		login string
-		cards int
-		err   string
-	}, len(logins))
+	results := make(chan refreshResult, len(logins))
 	var wg sync.WaitGroup
 
 	// Start workers
@@ -213,11 +211,7 @@ func runUserRefreshWorkerPool(ctx context.Context, log *slog.Logger, storage Dec
 					}
 					workerLog := log.With(slog.String("deckbox_id", login), slog.Int("worker_id", workerID))
 					cards, errStr := refreshUserListsWorker(ctx, workerLog, storage, scraper, login)
-					results <- struct {
-						login string
-						cards int
-						err   string
-					}{login: login, cards: cards, err: errStr}
+					results <- refreshResult{login: login, cards: cards, err: errStr}
 				}
 			}
 		}(i)
@@ -232,11 +226,7 @@ func runUserRefreshWorkerPool(ctx context.Context, log *slog.Logger, storage Dec
 	}()
 
 	// Collect results
-	collectedResults := []struct {
-		login string
-		cards int
-		err   string
-	}{}
+	collectedResults := []refreshResult{}
 	go func() {
 		wg.Wait()
 		close(results)

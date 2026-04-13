@@ -6,6 +6,7 @@ import (
 	"FriendlyCardFinder/internal/dto"
 	"context"
 	"database/sql"
+	"embed"
 	"fmt"
 	"log/slog"
 	"runtime"
@@ -14,11 +15,15 @@ import (
 	"time"
 	"unicode"
 
+	"github.com/pressly/goose/v3"
 	"golang.org/x/text/transform"
 	"golang.org/x/text/unicode/norm"
 
 	_ "github.com/mattn/go-sqlite3"
 )
+
+//go:embed migrations/*.sql
+var embedMigrations embed.FS
 
 type SQLiteStorage struct {
 	db         *DB
@@ -74,23 +79,17 @@ func New(dataSourceName string, log *slog.Logger) (*SQLiteStorage, error) {
 		readDB:  readDB,
 	}
 
-	err = createUsersTable(db.writeDB)
-	if err != nil {
-		return nil, fmt.Errorf("%s: %w", op, err)
+	goose.SetBaseFS(embedMigrations)
+	goose.SetLogger(goose.NopLogger())
+	if err := goose.SetDialect("sqlite3"); err != nil {
+		return nil, fmt.Errorf("%s: set goose dialect: %w", op, err)
+	}
+	if err := goose.Up(db.writeDB, "migrations"); err != nil {
+		return nil, fmt.Errorf("%s: run migrations: %w", op, err)
 	}
 
-	err = createDeckboxUsersTable(db.writeDB)
-	if err != nil {
-		return nil, fmt.Errorf("%s: %w", op, err)
-	}
-
-	err = createCardListsTable(db.writeDB)
-	if err != nil {
-		return nil, fmt.Errorf("%s: %w", op, err)
-	}
-
-	// Try to create an FTS5 virtual table to support fast card name searches.
-	// If the environment does not support FTS5, we gracefully continue without it.
+	// FTS5 virtual table is handled separately because its availability depends
+	// on the SQLite build — we degrade gracefully if it is not supported.
 	ftsEnabled := createFtsTable(db.writeDB)
 
 	// Read batch size from environment variable if set
@@ -634,116 +633,3 @@ func normalizeASCII(s string) string {
 	return strings.ToLower(out)
 }
 
-func createUsersTable(db *sql.DB) error {
-	const op = "storage.sqlite.createUsersTable"
-
-	stmt, err := db.Prepare(`
-    CREATE TABLE IF NOT EXISTS users(
-        telegramId INTEGER PRIMARY KEY,
-        deckboxLogin TEXT NOT NULL UNIQUE,
-        username TEXT NOT NULL UNIQUE
-        );
-    `)
-	if err != nil {
-		return fmt.Errorf("%s: %w", op, err)
-	}
-	defer stmt.Close()
-
-	_, err = stmt.Exec()
-	if err != nil {
-		return fmt.Errorf("%s: %w", op, err)
-	}
-
-	// Create indexes
-	_, err = db.Exec(`CREATE INDEX IF NOT EXISTS idx_deckboxLogin ON users(deckboxLogin);`)
-	if err != nil {
-		return fmt.Errorf("%s: %w", op, err)
-	}
-
-	_, err = db.Exec(`CREATE INDEX IF NOT EXISTS idx_username ON users(username);`)
-	if err != nil {
-		return fmt.Errorf("%s: %w", op, err)
-	}
-
-	return nil
-}
-
-func createDeckboxUsersTable(db *sql.DB) error {
-	const op = "storage.sqlite.createDeckboxUsersTable"
-
-	stmt, err := db.Prepare(`
-    CREATE TABLE IF NOT EXISTS deckbox_users(
-        deckboxLogin TEXT PRIMARY KEY,
-        inventoryId INTEGER,
-        tradelistId INTEGER,
-        wishlistId INTEGER,
-        updated_at INTEGER
-        );
-    `)
-	if err != nil {
-		return fmt.Errorf("%s: %w", op, err)
-	}
-	defer stmt.Close()
-
-	_, err = stmt.Exec()
-	if err != nil {
-		return fmt.Errorf("%s: %w", op, err)
-	}
-
-	// Create indexes
-	_, err = db.Exec(`CREATE INDEX IF NOT EXISTS idx_inventoryId ON deckbox_users(inventoryId);`)
-	if err != nil {
-		return fmt.Errorf("%s: %w", op, err)
-	}
-
-	_, err = db.Exec(`CREATE INDEX IF NOT EXISTS idx_tradelistId ON deckbox_users(tradelistId);`)
-	if err != nil {
-		return fmt.Errorf("%s: %w", op, err)
-	}
-
-	_, err = db.Exec(`CREATE INDEX IF NOT EXISTS idx_wishlistId ON deckbox_users(wishlistId);`)
-	if err != nil {
-		return fmt.Errorf("%s: %w", op, err)
-	}
-
-	return nil
-}
-
-func createCardListsTable(db *sql.DB) error {
-	const op = "storage.sqlite.createCardListsTable"
-
-	stmt, err := db.Prepare(`
-    CREATE TABLE IF NOT EXISTS card_lists(
-        listId INTEGER NOT NULL,
-        cardName TEXT NOT NULL,
-        quantity INTEGER NOT NULL
-        );
-    `)
-	if err != nil {
-		return fmt.Errorf("%s: %w", op, err)
-	}
-	defer stmt.Close()
-
-	_, err = stmt.Exec()
-	if err != nil {
-		return fmt.Errorf("%s: %w", op, err)
-	}
-
-	// Create indexes
-	_, err = db.Exec(`CREATE INDEX IF NOT EXISTS idx_listId ON card_lists(listId);`)
-	if err != nil {
-		return fmt.Errorf("%s: %w", op, err)
-	}
-
-	_, err = db.Exec(`CREATE INDEX IF NOT EXISTS idx_cardName ON card_lists(cardName);`)
-	if err != nil {
-		return fmt.Errorf("%s: %w", op, err)
-	}
-
-	_, err = db.Exec(`CREATE INDEX IF NOT EXISTS idx_listIdToCardName ON card_lists(listId, cardName);`)
-	if err != nil {
-		return fmt.Errorf("%s: %w", op, err)
-	}
-
-	return nil
-}
