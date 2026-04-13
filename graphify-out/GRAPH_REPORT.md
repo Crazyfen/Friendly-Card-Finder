@@ -1,30 +1,32 @@
-# Graph Report - .  (2026-04-12)
+# Graph Report - .  (2026-04-13)
 
 ## Corpus Check
-- Corpus is ~12,077 words - fits in a single context window. You may not need a graph.
+- 16 files · ~12,430 words
+- Verdict: corpus is large enough that graph structure adds value.
 
 ## Summary
-- 168 nodes · 208 edges · 16 communities detected
+- 168 nodes · 200 edges · 17 communities detected
 - Extraction: 98% EXTRACTED · 2% INFERRED · 0% AMBIGUOUS · INFERRED: 5 edges (avg confidence: 0.8)
 - Token cost: 0 input · 0 output
 
 ## Community Hubs (Navigation)
-- [[_COMMUNITY_Test Mocks and Fakes|Test Mocks and Fakes]]
-- [[_COMMUNITY_Deployment and Configuration|Deployment and Configuration]]
-- [[_COMMUNITY_SQLite Storage Layer|SQLite Storage Layer]]
-- [[_COMMUNITY_Domain Types and Interfaces|Domain Types and Interfaces]]
-- [[_COMMUNITY_Storage Tests and Benchmarks|Storage Tests and Benchmarks]]
-- [[_COMMUNITY_Storage Mock Implementations|Storage Mock Implementations]]
-- [[_COMMUNITY_User Refresh Worker Pool|User Refresh Worker Pool]]
-- [[_COMMUNITY_SQLite Performance Design|SQLite Performance Design]]
-- [[_COMMUNITY_Bot Entry and Handlers|Bot Entry and Handlers]]
-- [[_COMMUNITY_Scraper Integration Tests|Scraper Integration Tests]]
-- [[_COMMUNITY_Message Utility Tests|Message Utility Tests]]
-- [[_COMMUNITY_App Configuration|App Configuration]]
-- [[_COMMUNITY_Internationalization|Internationalization]]
-- [[_COMMUNITY_Search Data Transfer|Search Data Transfer]]
-- [[_COMMUNITY_Error Logging Helper|Error Logging Helper]]
-- [[_COMMUNITY_Storage Interface|Storage Interface]]
+- [[_COMMUNITY_Community 0|Community 0]]
+- [[_COMMUNITY_Community 1|Community 1]]
+- [[_COMMUNITY_Community 2|Community 2]]
+- [[_COMMUNITY_Community 3|Community 3]]
+- [[_COMMUNITY_Community 4|Community 4]]
+- [[_COMMUNITY_Community 5|Community 5]]
+- [[_COMMUNITY_Community 6|Community 6]]
+- [[_COMMUNITY_Community 7|Community 7]]
+- [[_COMMUNITY_Community 8|Community 8]]
+- [[_COMMUNITY_Community 9|Community 9]]
+- [[_COMMUNITY_Community 10|Community 10]]
+- [[_COMMUNITY_Community 11|Community 11]]
+- [[_COMMUNITY_Community 12|Community 12]]
+- [[_COMMUNITY_Community 13|Community 13]]
+- [[_COMMUNITY_Community 14|Community 14]]
+- [[_COMMUNITY_Community 15|Community 15]]
+- [[_COMMUNITY_Community 16|Community 16]]
 
 ## God Nodes (most connected - your core abstractions)
 1. `SQLiteStorage` - 11 edges
@@ -33,9 +35,9 @@
 4. `FriendlyCardFinder` - 10 edges
 5. `newTestDB()` - 7 edges
 6. `Environment Configuration (.env)` - 7 edges
-7. `internal/storage/sqlite Package` - 6 edges
-8. `Deckbox Scraper (scrapper.go)` - 6 edges
-9. `New()` - 5 edges
+7. `App` - 6 edges
+8. `internal/storage/sqlite Package` - 6 edges
+9. `Deckbox Scraper (scrapper.go)` - 6 edges
 10. `FTS5 Full-Text Search` - 5 edges
 
 ## Surprising Connections (you probably didn't know these)
@@ -49,94 +51,100 @@
 
 ## Communities
 
-### Community 0 - "Test Mocks and Fakes"
+### Community 0 - "Community 0"
 Cohesion: 0.09
 Nodes (5): fakeScraper, fakeStorage, TestSearchCardEmpty(), TestSearchCardGroupsByListId(), TestSearchCardSameCardAcrossLists()
 
-### Community 1 - "Deployment and Configuration"
+### Community 1 - "Community 1"
 Cohesion: 0.12
 Nodes (23): BOT_TOKEN Env Var, Deckbox.org, internal/deckbox Package, DeckboxSaver Interface (mock), DECKBOX_SESSION_COOKIE Env Var, Docker / docker-compose, Environment Configuration (.env), ENV Var (log level) (+15 more)
 
-### Community 2 - "SQLite Storage Layer"
-Cohesion: 0.21
-Nodes (9): buildFtsQueryTerm(), createCardListsTable(), createDeckboxUsersTable(), createFtsTable(), createUsersTable(), DB, New(), normalizeASCII() (+1 more)
+### Community 2 - "Community 2"
+Cohesion: 0.11
+Nodes (9): BotUser, CardList, CardListOwnerInfo, CardListWithOwner, DeckboxSaver, DeckboxUser, Scraper, SearchCardResult (+1 more)
 
-### Community 3 - "Domain Types and Interfaces"
-Cohesion: 0.12
-Nodes (8): BotUser, CardList, CardListOwnerInfo, DeckboxSaver, DeckboxUser, Scraper, SearchCardResult, extractIDFromElement()
+### Community 3 - "Community 3"
+Cohesion: 0.22
+Nodes (6): buildFtsQueryTerm(), createFtsTable(), DB, New(), normalizeASCII(), SQLiteStorage
 
-### Community 4 - "Storage Tests and Benchmarks"
+### Community 4 - "Community 4"
 Cohesion: 0.18
 Nodes (10): benchmarkSearchCard(), BenchmarkSearchCard_FTSDisabled(), BenchmarkSearchCard_FTSEnabled(), newTestDB(), TestClearCardList(), TestGetAllDeckboxUsersWithOldLists(), TestGetDeckboxUser(), TestGetOwnerByListId() (+2 more)
 
-### Community 5 - "Storage Mock Implementations"
+### Community 5 - "Community 5"
 Cohesion: 0.14
 Nodes (1): mockOwnerStorage
 
-### Community 6 - "User Refresh Worker Pool"
-Cohesion: 0.26
-Nodes (10): profileFetcher, SuggestDeckboxResult, commandArguments(), GetProfileData(), NewUser(), RefreshStaleUserLists(), refreshUserListsWorker(), runUserRefreshWorkerPool() (+2 more)
+### Community 6 - "Community 6"
+Cohesion: 0.24
+Nodes (10): profileFetcher, refreshResult, SuggestDeckboxResult, GetProfileData(), NewUser(), RefreshStaleUserLists(), refreshUserListsWorker(), runUserRefreshWorkerPool() (+2 more)
 
-### Community 7 - "SQLite Performance Design"
+### Community 7 - "Community 7"
 Cohesion: 0.2
 Nodes (12): Batch Insert Strategy (~1000 cards), CARD_LIST_BATCH_SIZE Env Var, card_lists_fts Virtual Table, Dual DB Connections (read/write split), FTS5 Full-Text Search, github.com/mattn/go-sqlite3 Driver, Rationale: Batch inserts avoid SQLite param limit, Rationale: Separate read/write connections for concurrency (+4 more)
 
-### Community 8 - "Bot Entry and Handlers"
+### Community 8 - "Community 8"
 Cohesion: 0.27
-Nodes (6): contextKey, defaultHandler(), main(), sellHandler(), setupLogger(), splitMessage()
+Nodes (4): App, main(), sendHTMLReply(), setupLogger()
 
-### Community 9 - "Scraper Integration Tests"
+### Community 9 - "Community 9"
 Cohesion: 0.83
 Nodes (3): scraperFromEnv(), TestCardListScrapper(), TestUserScrapper()
 
-### Community 10 - "Message Utility Tests"
+### Community 10 - "Community 10"
 Cohesion: 0.67
 Nodes (0): 
 
-### Community 11 - "App Configuration"
+### Community 11 - "Community 11"
 Cohesion: 0.67
 Nodes (1): Config
 
-### Community 12 - "Internationalization"
+### Community 12 - "Community 12"
 Cohesion: 0.67
 Nodes (0): 
 
-### Community 13 - "Search Data Transfer"
+### Community 13 - "Community 13"
 Cohesion: 1.0
 Nodes (1): CardSearchDTO
 
-### Community 14 - "Error Logging Helper"
+### Community 14 - "Community 14"
 Cohesion: 1.0
 Nodes (0): 
 
-### Community 15 - "Storage Interface"
+### Community 15 - "Community 15"
+Cohesion: 1.0
+Nodes (0): 
+
+### Community 16 - "Community 16"
 Cohesion: 1.0
 Nodes (0): 
 
 ## Knowledge Gaps
-- **24 isolated node(s):** `contextKey`, `Config`, `BotUser`, `DeckboxUser`, `CardListOwnerInfo` (+19 more)
+- **25 isolated node(s):** `Config`, `BotUser`, `DeckboxUser`, `CardListOwnerInfo`, `CardListWithOwner` (+20 more)
   These have ≤1 connection - possible missing edges or undocumented components.
-- **Thin community `Search Data Transfer`** (2 nodes): `CardSearchDTO`, `dto.go`
+- **Thin community `Community 13`** (2 nodes): `CardSearchDTO`, `dto.go`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Error Logging Helper`** (2 nodes): `sl.go`, `Err()`
+- **Thin community `Community 14`** (2 nodes): `sl.go`, `Err()`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Storage Interface`** (1 nodes): `storage.go`
+- **Thin community `Community 15`** (2 nodes): `split.go`, `SplitMessage()`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 16`** (1 nodes): `storage.go`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
 
 ## Suggested Questions
 _Questions this graph is uniquely positioned to answer:_
 
-- **Why does `FriendlyCardFinder` connect `Deployment and Configuration` to `SQLite Performance Design`?**
+- **Why does `FriendlyCardFinder` connect `Community 1` to `Community 7`?**
   _High betweenness centrality (0.025) - this node is a cross-community bridge._
-- **Why does `Environment Configuration (.env)` connect `Deployment and Configuration` to `SQLite Performance Design`?**
+- **Why does `Environment Configuration (.env)` connect `Community 1` to `Community 7`?**
   _High betweenness centrality (0.012) - this node is a cross-community bridge._
-- **What connects `contextKey`, `Config`, `BotUser` to the rest of the system?**
-  _24 weakly-connected nodes found - possible documentation gaps or missing edges._
-- **Should `Test Mocks and Fakes` be split into smaller, more focused modules?**
+- **What connects `Config`, `BotUser`, `DeckboxUser` to the rest of the system?**
+  _25 weakly-connected nodes found - possible documentation gaps or missing edges._
+- **Should `Community 0` be split into smaller, more focused modules?**
   _Cohesion score 0.09 - nodes in this community are weakly interconnected._
-- **Should `Deployment and Configuration` be split into smaller, more focused modules?**
+- **Should `Community 1` be split into smaller, more focused modules?**
   _Cohesion score 0.12 - nodes in this community are weakly interconnected._
-- **Should `Domain Types and Interfaces` be split into smaller, more focused modules?**
-  _Cohesion score 0.12 - nodes in this community are weakly interconnected._
-- **Should `Storage Mock Implementations` be split into smaller, more focused modules?**
+- **Should `Community 2` be split into smaller, more focused modules?**
+  _Cohesion score 0.11 - nodes in this community are weakly interconnected._
+- **Should `Community 5` be split into smaller, more focused modules?**
   _Cohesion score 0.14 - nodes in this community are weakly interconnected._
