@@ -93,10 +93,37 @@ go test -tags "fts5" ./internal/storage/sqlite -v
 - Добавьте обработчик в `main.go` и реализуйте бизнес-логику в `internal/deckbox/handler.go`.
 - Для тестирования асинхронных потоков используйте мок `DeckboxSaver` или синхронизацию (channels/waitgroups).
 
-**Запуск в продакшене**
+**Запуск через Docker**
 
-- Настройте корректный `STORAGE_PATH` и секреты (BOT_TOKEN, DECKBOX_SESSION_COOKIE) в безопасном хранилище окружения.
-- Запускайте без `ENV=local` для уровня логирования `info`.
+Собрать образ локально:
+
+```bash
+docker build -t friendlycardfinder .
+```
+
+Запустить с `docker compose` (требует `.env` в текущей директории):
+
+```bash
+docker compose up -d
+```
+
+**CI/CD (GitHub Actions)**
+
+При каждом пуше в ветку `main` автоматически выполняются:
+
+1. `go test -tags fts5 -race ./...`
+2. Сборка Docker-образа и публикация в GitHub Container Registry (`ghcr.io/crazyfen/friendlycardfinder`)
+3. Деплой на VPS: копирование `docker-compose.yml` по SCP, затем `docker compose pull && up -d`
+
+Необходимые GitHub Secrets:
+
+| Secret            | Описание                                     |
+| ----------------- | -------------------------------------------- |
+| `SSH_HOST`        | IP или домен VPS                             |
+| `SSH_USER`        | Пользователь SSH                             |
+| `SSH_PRIVATE_KEY` | Приватный SSH-ключ (полное содержимое файла) |
+
+`.env` на VPS с `BOT_TOKEN`, `STORAGE_PATH`, `DECKBOX_SESSION_COOKIE`, `ENV` необходимо создать вручную один раз в директории `~/friendlycardfinder/`.
 
 **Контакты и вклад**
 

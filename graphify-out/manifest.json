@@ -1,0 +1,18 @@
+{
+  "main.go": 1773821694.2084882,
+  "main_test.go": 1770739261.1735454,
+  "internal\\config\\config.go": 1770739261.1713603,
+  "internal\\deckbox\\deckbox.go": 1773790080.8141246,
+  "internal\\deckbox\\deckbox_test.go": 1773778198.9886382,
+  "internal\\deckbox\\handler.go": 1774558874.3949285,
+  "internal\\deckbox\\handler_test.go": 1773778045.6344974,
+  "internal\\deckbox\\scrapper.go": 1773774272.5637138,
+  "internal\\deckbox\\scrapper_test.go": 1773780430.1781046,
+  "internal\\dto\\dto.go": 1770739261.1713603,
+  "internal\\i18n\\i18n.go": 1770749152.7545161,
+  "internal\\lib\\logger\\sl\\sl.go": 1770739261.1713603,
+  "internal\\storage\\storage.go": 1770739261.1713603,
+  "internal\\storage\\sqlite\\sqlite.go": 1774387976.719139,
+  "internal\\storage\\sqlite\\sqlite_test.go": 1773779143.6761923,
+  "README.md": 1776024240.9049275
+}
