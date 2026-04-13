@@ -1,6 +1,7 @@
 package main
 
 import (
+	"FriendlyCardFinder/internal/lib/tgutil"
 	"strings"
 	"testing"
 )
@@ -94,7 +95,7 @@ func TestSplitMessage(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			result := splitMessage(tt.input, tt.limit)
+			result := tgutil.SplitMessage(tt.input, tt.limit)
 
 			if len(result) != len(tt.expected) {
 				t.Errorf("expected %d parts, got %d", len(tt.expected), len(result))
@@ -119,10 +120,10 @@ func TestSplitMessage(t *testing.T) {
 }
 
 func BenchmarkSplitMessage(b *testing.B) {
-	largeMessage := strings.Repeat("This is a sample message to benchmark the splitMessage function. ", 1000)
+	largeMessage := strings.Repeat("This is a sample message to benchmark the tgutil.SplitMessage function. ", 1000)
 	limit := 4096
 
 	for b.Loop() {
-		splitMessage(largeMessage, limit)
+		tgutil.SplitMessage(largeMessage, limit)
 	}
 }

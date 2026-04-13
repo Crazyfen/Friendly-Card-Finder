@@ -18,7 +18,7 @@ func NewUser(ctx context.Context, log *slog.Logger, storage DeckboxSaver, scrape
 	const op = "handlers.deckbox.NewUser"
 	log = log.With(slog.String("operation", op), slog.String("message_id", strconv.Itoa(message.ID)))
 
-	argument := commandArguments(message)
+	argument := NewCommandArguments(message)
 	if argument == "" {
 		log.Info("forgotten deckbox login")
 		return i18n.T(lang, "deckbox.register_no_argument")
@@ -310,23 +310,6 @@ func SearchCard(ctx context.Context, log *slog.Logger, storage DeckboxSaver, car
 	}
 
 	return SearchCardResult{SearchQuery: cardName, SearchResults: searchResults}, nil
-}
-
-func commandArguments(m *models.Message) string {
-	if len(m.Entities) == 0 {
-		return ""
-	}
-	entity := m.Entities[0]
-
-	if entity.Type != models.MessageEntityTypeBotCommand {
-		return ""
-	}
-
-	if len(m.Text) == entity.Length {
-		return ""
-	}
-
-	return m.Text[entity.Length+1:]
 }
 
 type SuggestDeckboxResult struct {

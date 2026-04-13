@@ -5,6 +5,7 @@ import (
 	"FriendlyCardFinder/internal/deckbox"
 	"FriendlyCardFinder/internal/i18n"
 	"FriendlyCardFinder/internal/lib/logger/sl"
+	"FriendlyCardFinder/internal/lib/tgutil"
 	"FriendlyCardFinder/internal/storage/sqlite"
 	"context"
 	"fmt"
@@ -39,7 +40,7 @@ func main() {
 	log := setupLogger(cfg.Env)
 	log = log.With(slog.String("env", cfg.Env))
 
-	storage, err := sqlite.New(cfg.StoragePath)
+	storage, err := sqlite.New(cfg.StoragePath, log)
 	if err != nil {
 		log.Error("failed to initialize storage", sl.Err(err))
 		os.Exit(1)
@@ -116,39 +117,7 @@ func defaultHandler(ctx context.Context, b *bot.Bot, update *models.Update) {
 
 		message := result.FormatForTelegram(ctx, ctx.Value(storageKey).(deckbox.DeckboxSaver), lang, deckbox.ScopeTradelist)
 		log.Info("sending card search response", slog.String("message", message))
-
-		if len(message) > 4096 {
-			parts := splitMessage(message, 4096)
-			partsReplyTo := []int{int(update.Message.ID)}
-			for i, p := range parts {
-				reply, err := b.SendMessage(ctx, &bot.SendMessageParams{
-					ChatID:    update.Message.Chat.ID,
-					Text:      p,
-					ParseMode: models.ParseModeHTML,
-					ReplyParameters: &models.ReplyParameters{
-						MessageID: partsReplyTo[i],
-					},
-				})
-				if err != nil {
-					log.Error("failed to send card search response part", sl.Err(err), slog.String("part:", p))
-				}
-				partsReplyTo = append(partsReplyTo, int(reply.ID))
-			}
-			continue
-		} else {
-
-			_, err = b.SendMessage(ctx, &bot.SendMessageParams{
-				ChatID:    update.Message.Chat.ID,
-				Text:      message,
-				ParseMode: models.ParseModeHTML,
-				ReplyParameters: &models.ReplyParameters{
-					MessageID: int(update.Message.ID),
-				},
-			})
-			if err != nil {
-				log.Error("failed to send card search response", sl.Err(err))
-			}
-		}
+		sendHTMLReply(ctx, b, update.Message.Chat.ID, int(update.Message.ID), message, log)
 	}
 }
 
@@ -287,88 +256,28 @@ func sellHandler(ctx context.Context, b *bot.Bot, update *models.Update) {
 		}
 
 		message := result.FormatForTelegram(ctx, ctx.Value(storageKey).(deckbox.DeckboxSaver), lang, deckbox.ScopeWishlist)
-
-		if len(message) > 4096 {
-			parts := splitMessage(message, 4096)
-			partsReplyTo := []int{int(update.Message.ID)}
-			for i, p := range parts {
-				reply, err := b.SendMessage(ctx, &bot.SendMessageParams{
-					ChatID:    update.Message.Chat.ID,
-					Text:      p,
-					ParseMode: models.ParseModeHTML,
-					ReplyParameters: &models.ReplyParameters{
-						MessageID: partsReplyTo[i],
-					},
-				})
-				if err != nil {
-					log.Error("failed to send sell response part", sl.Err(err), slog.String("part", p))
-				}
-				partsReplyTo = append(partsReplyTo, int(reply.ID))
-			}
-			continue
-		} else {
-			_, err = b.SendMessage(ctx, &bot.SendMessageParams{
-				ChatID:    update.Message.Chat.ID,
-				Text:      message,
-				ParseMode: models.ParseModeHTML,
-				ReplyParameters: &models.ReplyParameters{
-					MessageID: int(update.Message.ID),
-				},
-			})
-			if err != nil {
-				log.Error("failed to send sell response", sl.Err(err))
-			}
-		}
+		sendHTMLReply(ctx, b, update.Message.Chat.ID, int(update.Message.ID), message, log)
 	}
 }
 
-// splitMessage splits s into chunks not exceeding limit bytes,
-// preferring to cut at the nearest newline before the limit.
-// Preserves newlines in the chunk before the cut point when possible.
-// Handles multi-byte UTF-8 characters correctly by respecting rune boundaries.
-// If the final segment exceeds the limit, it is recursively split.
-func splitMessage(s string, limit int) []string {
-	if len(s) <= limit {
-		return []string{s}
-	}
-	var parts []string
-	start := 0
-	lastNewline := -1
-
-	for idx, r := range s {
-		// Record newline position before checking limit
-		if r == '\n' {
-			lastNewline = idx
+// sendHTMLReply sends an HTML-formatted message, splitting it into chained reply
+// parts if it exceeds Telegram's 4096-byte limit.
+func sendHTMLReply(ctx context.Context, b *bot.Bot, chatID int64, replyToID int, message string, log *slog.Logger) {
+	parts := tgutil.SplitMessage(message, 4096)
+	replyTo := replyToID
+	for _, p := range parts {
+		reply, err := b.SendMessage(ctx, &bot.SendMessageParams{
+			ChatID:    chatID,
+			Text:      p,
+			ParseMode: models.ParseModeHTML,
+			ReplyParameters: &models.ReplyParameters{
+				MessageID: replyTo,
+			},
+		})
+		if err != nil {
+			log.Error("failed to send response", sl.Err(err))
+			return
 		}
-
-		// Check if we've reached or exceeded the limit
-		if idx-start >= limit {
-			if lastNewline >= start && lastNewline+1-start <= limit {
-				// Include newline in this chunk (if it doesn't exceed limit)
-				parts = append(parts, s[start:lastNewline+1])
-				start = lastNewline + 1
-			} else if lastNewline >= start {
-				// Newline exists but including it would exceed limit, cut before it
-				parts = append(parts, s[start:lastNewline])
-				start = lastNewline
-			} else {
-				// No newline, cut at current position (start of rune that exceeds limit)
-				parts = append(parts, s[start:idx])
-				start = idx
-			}
-			lastNewline = -1
-		}
+		replyTo = int(reply.ID)
 	}
-
-	// Handle remaining portion, recursively split if still too large
-	if start < len(s) {
-		remaining := s[start:]
-		if len(remaining) > limit {
-			parts = append(parts, splitMessage(remaining, limit)...)
-		} else {
-			parts = append(parts, remaining)
-		}
-	}
-
-	return parts
 }

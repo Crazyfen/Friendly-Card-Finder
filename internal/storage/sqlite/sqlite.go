@@ -22,6 +22,7 @@ import (
 
 type SQLiteStorage struct {
 	db         *DB
+	log        *slog.Logger
 	ftsEnabled bool
 	batchSize  int
 }
@@ -33,7 +34,7 @@ type DB struct {
 	readDB  *sql.DB
 }
 
-func New(dataSourceName string) (*SQLiteStorage, error) {
+func New(dataSourceName string, log *slog.Logger) (*SQLiteStorage, error) {
 	const op = "storage.sqlite.New"
 
 	writeDB, err := sql.Open("sqlite3", dataSourceName)
@@ -100,7 +101,7 @@ func New(dataSourceName string) (*SQLiteStorage, error) {
 		}
 	}
 
-	return &SQLiteStorage{db: db, ftsEnabled: ftsEnabled, batchSize: batchSize}, nil
+	return &SQLiteStorage{db: db, log: log, ftsEnabled: ftsEnabled, batchSize: batchSize}, nil
 }
 
 func (s *SQLiteStorage) Close() error {
@@ -262,7 +263,7 @@ func (s *SQLiteStorage) GetAllDeckboxUsersWithOldLists(ctx context.Context, thre
 
 func (s *SQLiteStorage) SaveCardList(ctx context.Context, list deckbox.CardList) error {
 	const op = "storage.sqlite.SaveCardList"
-	log := slog.Default()
+	log := s.log
 
 	err := s.ClearCardList(ctx, list.ListId)
 	if err != nil {

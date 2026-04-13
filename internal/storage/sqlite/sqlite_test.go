@@ -14,7 +14,8 @@ import (
 // newTestDB creates a SQLiteStorage backed by a temp file and registers cleanup.
 func newTestDB(t *testing.T) *SQLiteStorage {
 	t.Helper()
-	s, err := New(t.TempDir() + "/test.db")
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	s, err := New(t.TempDir()+"/test.db", log)
 	if err != nil {
 		t.Fatalf("failed to create test storage: %v", err)
 	}
@@ -46,7 +47,7 @@ func newTestDB(t *testing.T) *SQLiteStorage {
 func TestSaveCardListWithLargeCollection(t *testing.T) {
 	// Create a temporary database for testing
 	dbFile := t.TempDir() + "/test.db"
-	storage, err := New(dbFile)
+	storage, err := New(dbFile, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	if err != nil {
 		t.Fatalf("failed to create storage: %v", err)
 	}
@@ -120,7 +121,7 @@ func TestSaveCardListBatching(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			dbFile := t.TempDir() + "/test.db"
-			storage, err := New(dbFile)
+			storage, err := New(dbFile, slog.New(slog.NewTextHandler(io.Discard, nil)))
 			if err != nil {
 				t.Fatalf("failed to create storage: %v", err)
 			}
@@ -180,7 +181,7 @@ func TestSaveCardListBatching(t *testing.T) {
 func TestSaveCardListTransactionRollback(t *testing.T) {
 	// Test that transaction rolls back on error
 	dbFile := t.TempDir() + "/test.db"
-	storage, err := New(dbFile)
+	storage, err := New(dbFile, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	if err != nil {
 		t.Fatalf("failed to create storage: %v", err)
 	}
@@ -251,7 +252,7 @@ func TestSaveCardListTransactionRollback(t *testing.T) {
 func TestSearchCardWithFTS(t *testing.T) {
 	// Ensure FTS is available in this environment
 	dbFile := t.TempDir() + "/test.db"
-	storage, err := New(dbFile)
+	storage, err := New(dbFile, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	if err != nil {
 		t.Fatalf("failed to create storage: %v", err)
 	}
@@ -370,7 +371,7 @@ func TestSearchCardWithFTS(t *testing.T) {
 
 func TestSearchCardWishlist(t *testing.T) {
 	dbFile := t.TempDir() + "/test.db"
-	storage, err := New(dbFile)
+	storage, err := New(dbFile, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	if err != nil {
 		t.Fatalf("failed to create storage: %v", err)
 	}
@@ -706,7 +707,7 @@ func BenchmarkSaveCardList(b *testing.B) {
 
 	// Setup once; benchmark SaveCardList performance.
 	dbFile := b.TempDir() + "/bench.db"
-	storage, err := New(dbFile)
+	storage, err := New(dbFile, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	if err != nil {
 		b.Fatalf("failed to create storage: %v", err)
 	}
@@ -748,7 +749,7 @@ func benchmarkSearchCard(b *testing.B, wantFTS bool) {
 
 	// Setup once; benchmark SearchCard performance.
 	dbFile := b.TempDir() + "/bench.db"
-	storage, err := New(dbFile)
+	storage, err := New(dbFile, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	if err != nil {
 		b.Fatalf("failed to create storage: %v", err)
 	}
