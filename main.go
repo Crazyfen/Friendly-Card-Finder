@@ -14,21 +14,23 @@ import (
 	"os/signal"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/go-telegram/bot"
 	"github.com/go-telegram/bot/models"
 )
 
-type contextKey string
+type App struct {
+	log     *slog.Logger
+	storage deckbox.DeckboxSaver
+	scraper *deckbox.Scraper
+	cfg     *config.Config
+}
 
 const (
-	logKey     contextKey = "log"
-	storageKey contextKey = "storage"
-	scraperKey contextKey = "scraper"
-	configKey  contextKey = "config"
-	envLocal              = "local"
-	envDev                = "dev"
-	envProd               = "prod"
+	envLocal = "local"
+	envDev   = "dev"
+	envProd  = "prod"
 )
 
 func main() {
@@ -51,15 +53,31 @@ func main() {
 		}
 	}()
 
-	scraper := deckbox.NewScraper(log, cfg.DeckboxSessionCookie)
+	app := &App{
+		log:     log,
+		storage: storage,
+		scraper: deckbox.NewScraper(log, cfg.DeckboxSessionCookie),
+		cfg:     cfg,
+	}
 
-	ctx = context.WithValue(ctx, logKey, log)
-	ctx = context.WithValue(ctx, storageKey, storage)
-	ctx = context.WithValue(ctx, scraperKey, scraper)
-	ctx = context.WithValue(ctx, configKey, cfg)
+	// Background refresh: runs immediately at startup then on a ticker so searches
+	// are never blocked waiting for stale lists to refresh.
+	go func() {
+		deckbox.RefreshStaleUserLists(ctx, app.log, app.storage, app.scraper, app.cfg.CardListRefreshHours)
+		ticker := time.NewTicker(time.Duration(30) * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				deckbox.RefreshStaleUserLists(ctx, app.log, app.storage, app.scraper, app.cfg.CardListRefreshHours)
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
 
 	opts := []bot.Option{
-		bot.WithDefaultHandler(defaultHandler),
+		bot.WithDefaultHandler(app.defaultHandler),
 	}
 
 	b, err := bot.New(cfg.BotToken, opts...)
@@ -68,63 +86,54 @@ func main() {
 		os.Exit(1)
 	}
 
-	b.RegisterHandler(bot.HandlerTypeMessageText, "/start", bot.MatchTypeExact, startHandler)
-	b.RegisterHandler(bot.HandlerTypeMessageText, "sell", bot.MatchTypeCommandStartOnly, sellHandler)
-	b.RegisterHandler(bot.HandlerTypeMessageText, "deckbox", bot.MatchTypeCommandStartOnly, deckboxHandler)
-	b.RegisterHandler(bot.HandlerTypeMessageText, "suggestdeckbox", bot.MatchTypeCommandStartOnly, suggestdeckboxHandler)
+	b.RegisterHandler(bot.HandlerTypeMessageText, "/start", bot.MatchTypeExact, app.startHandler)
+	b.RegisterHandler(bot.HandlerTypeMessageText, "sell", bot.MatchTypeCommandStartOnly, app.sellHandler)
+	b.RegisterHandler(bot.HandlerTypeMessageText, "deckbox", bot.MatchTypeCommandStartOnly, app.deckboxHandler)
+	b.RegisterHandler(bot.HandlerTypeMessageText, "suggestdeckbox", bot.MatchTypeCommandStartOnly, app.suggestdeckboxHandler)
 
 	log.Info("starting bot")
 	b.Start(ctx)
 }
 
 func setupLogger(env string) *slog.Logger {
-	var log *slog.Logger
-
 	switch env {
-	case envLocal:
-		fallthrough
-	case envDev:
-		log = slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelDebug}))
-
-	case envProd:
-		log = slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	case envLocal, envDev:
+		return slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	default:
+		return slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
 	}
-
-	return log
 }
 
-func defaultHandler(ctx context.Context, b *bot.Bot, update *models.Update) {
+func (a *App) defaultHandler(ctx context.Context, b *bot.Bot, update *models.Update) {
 	const op = "handlers.defaultHandler"
-	log := ctx.Value(logKey).(*slog.Logger)
-	log.With(slog.String("operation", op), slog.String("message_id", strconv.Itoa(update.Message.ID))).Info("handling default message")
+	log := a.log.With(slog.String("operation", op), slog.String("message_id", strconv.Itoa(update.Message.ID)))
+	log.Info("handling default message")
 
-	// Refresh stale user lists before searching
-	config := ctx.Value(configKey).(*config.Config)
-	deckbox.RefreshStaleUserLists(ctx, log, ctx.Value(storageKey).(deckbox.DeckboxSaver), ctx.Value(scraperKey).(*deckbox.Scraper), config.CardListRefreshHours)
-
-	// Detect language from user
 	lang := i18n.DetectLang(update.Message.From.LanguageCode)
 
 	for line := range strings.SplitSeq(update.Message.Text, "\n") {
 		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
 		log.Info("card to search", slog.String("line", line))
 
-		result, err := deckbox.SearchCard(ctx, log, ctx.Value(storageKey).(deckbox.DeckboxSaver), line, deckbox.ScopeTradelist)
+		result, err := deckbox.SearchCard(ctx, log, a.storage, line, deckbox.ScopeTradelist)
 		if err != nil {
 			log.Error("failed to search card", sl.Err(err))
 			continue
 		}
 
-		message := result.FormatForTelegram(ctx, ctx.Value(storageKey).(deckbox.DeckboxSaver), lang, deckbox.ScopeTradelist)
+		message := result.FormatForTelegram(lang, deckbox.ScopeTradelist)
 		log.Info("sending card search response", slog.String("message", message))
 		sendHTMLReply(ctx, b, update.Message.Chat.ID, int(update.Message.ID), message, log)
 	}
 }
 
-func startHandler(ctx context.Context, b *bot.Bot, update *models.Update) {
+func (a *App) startHandler(ctx context.Context, b *bot.Bot, update *models.Update) {
 	const op = "handlers.startHandler"
-	log := ctx.Value(logKey).(*slog.Logger)
-	log.With(slog.String("operation", op), slog.String("message_id", strconv.Itoa(update.Message.ID))).Info("handling /start command")
+	log := a.log.With(slog.String("operation", op), slog.String("message_id", strconv.Itoa(update.Message.ID)))
+	log.Info("handling /start command")
 
 	lang := i18n.DetectLang(update.Message.From.LanguageCode)
 	log.With(slog.String("LanguageCode", update.Message.From.LanguageCode), slog.String("detected_lang", lang)).Debug("detected user language")
@@ -135,18 +144,17 @@ func startHandler(ctx context.Context, b *bot.Bot, update *models.Update) {
 		ParseMode: models.ParseModeHTML,
 	})
 	if err != nil {
-		ctx.Value(logKey).(*slog.Logger).Error("failed to send /start response", sl.Err(err))
+		log.Error("failed to send /start response", sl.Err(err))
 	}
 }
 
-func deckboxHandler(ctx context.Context, b *bot.Bot, update *models.Update) {
+func (a *App) deckboxHandler(ctx context.Context, b *bot.Bot, update *models.Update) {
 	const op = "handlers.deckboxHandler"
-	log := ctx.Value(logKey).(*slog.Logger)
-	log.With(slog.String("operation", op), slog.String("message_id", strconv.Itoa(update.Message.ID))).Info("handling /deckbox command")
+	log := a.log.With(slog.String("operation", op), slog.String("message_id", strconv.Itoa(update.Message.ID)))
+	log.Info("handling /deckbox command")
 
-	scraper := ctx.Value(scraperKey).(*deckbox.Scraper)
 	lang := i18n.DetectLang(update.Message.From.LanguageCode)
-	response := deckbox.NewUser(ctx, log, ctx.Value(storageKey).(deckbox.DeckboxSaver), scraper, update.Message, lang)
+	response := deckbox.NewUser(ctx, log, a.storage, a.scraper, update.Message, lang)
 
 	_, err := b.SendMessage(ctx, &bot.SendMessageParams{
 		ChatID: update.Message.Chat.ID,
@@ -157,14 +165,10 @@ func deckboxHandler(ctx context.Context, b *bot.Bot, update *models.Update) {
 	}
 }
 
-func suggestdeckboxHandler(ctx context.Context, b *bot.Bot, update *models.Update) {
+func (a *App) suggestdeckboxHandler(ctx context.Context, b *bot.Bot, update *models.Update) {
 	const op = "handlers.suggestdeckboxHandler"
-	log := ctx.Value(logKey).(*slog.Logger)
-	log.With(slog.String("operation", op), slog.String("message_id", strconv.Itoa(update.Message.ID))).Info("handling /suggestdeckbox command")
-
-	cfg := ctx.Value(configKey).(*config.Config)
-	scraper := ctx.Value(scraperKey).(*deckbox.Scraper)
-	storage := ctx.Value(storageKey).(deckbox.DeckboxSaver)
+	log := a.log.With(slog.String("operation", op), slog.String("message_id", strconv.Itoa(update.Message.ID)))
+	log.Info("handling /suggestdeckbox command")
 
 	argument := deckbox.NewCommandArguments(update.Message)
 	lang := i18n.DetectLang(update.Message.From.LanguageCode)
@@ -179,14 +183,11 @@ func suggestdeckboxHandler(ctx context.Context, b *bot.Bot, update *models.Updat
 		return
 	}
 
-	// Parse logins (newline separated)
 	logins := strings.Split(argument, "\n")
 
-	// Spawn async processing
 	go func() {
-		result := deckbox.SuggestDeckbox(ctx, log, storage, scraper, logins, cfg.FreshnessTimeLimitHours)
+		result := deckbox.SuggestDeckbox(ctx, log, a.storage, a.scraper, logins, a.cfg.FreshnessTimeLimitHours)
 
-		// Format response
 		var response strings.Builder
 		response.WriteString(fmt.Sprintf(i18n.T(lang, "suggest.summary"),
 			result.ProcessedCount, result.SkippedCount))
@@ -211,7 +212,6 @@ func suggestdeckboxHandler(ctx context.Context, b *bot.Bot, update *models.Updat
 		}
 	}()
 
-	// Send immediate acknowledgement
 	_, err := b.SendMessage(ctx, &bot.SendMessageParams{
 		ChatID: update.Message.Chat.ID,
 		Text:   fmt.Sprintf(i18n.T(lang, "suggest.ack"), len(logins)),
@@ -221,10 +221,10 @@ func suggestdeckboxHandler(ctx context.Context, b *bot.Bot, update *models.Updat
 	}
 }
 
-func sellHandler(ctx context.Context, b *bot.Bot, update *models.Update) {
+func (a *App) sellHandler(ctx context.Context, b *bot.Bot, update *models.Update) {
 	const op = "handlers.sellHandler"
-	log := ctx.Value(logKey).(*slog.Logger)
-	log.With(slog.String("operation", op), slog.String("message_id", strconv.Itoa(update.Message.ID))).Info("handling /sell command")
+	log := a.log.With(slog.String("operation", op), slog.String("message_id", strconv.Itoa(update.Message.ID)))
+	log.Info("handling /sell command")
 
 	argument := deckbox.NewCommandArguments(update.Message)
 	lang := i18n.DetectLang(update.Message.From.LanguageCode)
@@ -239,23 +239,19 @@ func sellHandler(ctx context.Context, b *bot.Bot, update *models.Update) {
 		return
 	}
 
-	// Refresh stale user lists before searching
-	config := ctx.Value(configKey).(*config.Config)
-	deckbox.RefreshStaleUserLists(ctx, log, ctx.Value(storageKey).(deckbox.DeckboxSaver), ctx.Value(scraperKey).(*deckbox.Scraper), config.CardListRefreshHours)
-
 	for l := range strings.SplitSeq(argument, "\n") {
 		line := strings.TrimSpace(l)
 		if line == "" {
 			continue
 		}
 
-		result, err := deckbox.SearchCard(ctx, log, ctx.Value(storageKey).(deckbox.DeckboxSaver), line, deckbox.ScopeWishlist)
+		result, err := deckbox.SearchCard(ctx, log, a.storage, line, deckbox.ScopeWishlist)
 		if err != nil {
 			log.Error("failed to search card", sl.Err(err))
 			continue
 		}
 
-		message := result.FormatForTelegram(ctx, ctx.Value(storageKey).(deckbox.DeckboxSaver), lang, deckbox.ScopeWishlist)
+		message := result.FormatForTelegram(lang, deckbox.ScopeWishlist)
 		sendHTMLReply(ctx, b, update.Message.Chat.ID, int(update.Message.ID), message, log)
 	}
 }

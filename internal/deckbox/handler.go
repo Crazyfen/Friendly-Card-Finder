@@ -278,25 +278,27 @@ func SearchCard(ctx context.Context, log *slog.Logger, storage DeckboxSaver, car
 	}
 
 	var currentListId int64 = -1
-	var cardList CardList
-	var searchResults []CardList
+	var current CardListWithOwner
+	var searchResults []CardListWithOwner
 
 	for _, result := range results {
 		if currentListId != result.ListId {
 			if currentListId != -1 {
-				searchResults = append(searchResults, cardList)
+				searchResults = append(searchResults, current)
 			}
 			currentListId = result.ListId
-			cardList = CardList{
-				ListId: currentListId,
-				Cards:  make(map[string]int16),
+			current = CardListWithOwner{
+				CardList:         CardList{ListId: currentListId, Cards: make(map[string]int16)},
+				DeckboxLogin:     result.DeckboxLogin,
+				TelegramID:       result.TelegramID,
+				TelegramUsername: result.TelegramUsername,
 			}
 		}
-		cardList.AddCard(result.CardName, result.Quantity)
+		current.AddCard(result.CardName, result.Quantity)
 	}
 
-	if len(cardList.Cards) > 0 {
-		searchResults = append(searchResults, cardList)
+	if len(current.Cards) > 0 {
+		searchResults = append(searchResults, current)
 	}
 
 	return SearchCardResult{SearchQuery: cardName, SearchResults: searchResults}, nil

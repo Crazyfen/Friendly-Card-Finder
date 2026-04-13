@@ -37,9 +37,16 @@ type CardListOwnerInfo struct {
 	TelegramUsername *string
 }
 
+type CardListWithOwner struct {
+	CardList
+	DeckboxLogin     string
+	TelegramID       *int64
+	TelegramUsername *string
+}
+
 type SearchCardResult struct {
 	SearchQuery   string
-	SearchResults []CardList
+	SearchResults []CardListWithOwner
 }
 
 const (
@@ -83,8 +90,7 @@ func NewScraper(log *slog.Logger, sessionCookie string) *Scraper {
 	}
 }
 
-func (scr *SearchCardResult) FormatForTelegram(ctx context.Context, storage DeckboxSaver, lang string, scope string) string {
-	// Select i18n keys based on scope
+func (scr *SearchCardResult) FormatForTelegram(lang string, scope string) string {
 	noResultsKey := "search.no_results"
 	resultsHeaderKey := "search.results_header"
 	if scope == ScopeWishlist {
@@ -100,24 +106,15 @@ func (scr *SearchCardResult) FormatForTelegram(ctx context.Context, storage Deck
 	response.WriteString(fmt.Sprintf(i18n.T(lang, resultsHeaderKey), scr.SearchQuery))
 
 	for _, cl := range scr.SearchResults {
-		// Get owner info for this list
-		ownerInfo, err := storage.GetOwnerByListId(ctx, cl.ListId)
-		if err == nil {
-			// Format deckbox login with link to tradelist
-			uEnc := b64.URLEncoding.EncodeToString([]byte(scr.SearchQuery))
-			linkURL := fmt.Sprintf("https://deckbox.org/sets/%d?f=17%v", cl.ListId, uEnc)
-			deckboxLink := fmt.Sprintf(i18n.T(lang, "search.deckbox_link"), linkURL, ownerInfo.DeckboxLogin)
-			response.WriteString(deckboxLink)
+		uEnc := b64.URLEncoding.EncodeToString([]byte(scr.SearchQuery))
+		linkURL := fmt.Sprintf("https://deckbox.org/sets/%d?f=17%v", cl.ListId, uEnc)
+		response.WriteString(fmt.Sprintf(i18n.T(lang, "search.deckbox_link"), linkURL, cl.DeckboxLogin))
 
-			// Add telegram user link if available
-			if ownerInfo.TelegramID != nil && ownerInfo.TelegramUsername != nil {
-				fmt.Fprintf(&response, " ")
-				fmt.Fprintf(&response, "у <a href=\"tg://user?id=%d\">@%v</a>", *ownerInfo.TelegramID, *ownerInfo.TelegramUsername)
-			}
-			fmt.Fprintf(&response, ":\n")
+		if cl.TelegramID != nil && cl.TelegramUsername != nil {
+			fmt.Fprintf(&response, " у <a href=\"tg://user?id=%d\">@%v</a>", *cl.TelegramID, *cl.TelegramUsername)
 		}
+		fmt.Fprintf(&response, ":\n")
 
-		// Add cards
 		for cardName, quantity := range cl.Cards {
 			response.WriteString(fmt.Sprintf("%s: %d\n", cardName, quantity))
 		}

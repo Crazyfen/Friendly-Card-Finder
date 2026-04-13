@@ -141,28 +141,18 @@ func (s *SQLiteStorage) SaveDeckboxUser(ctx context.Context, user deckbox.Deckbo
 	const op = "storage.sqlite.SaveDeckboxUser"
 
 	stmt, err := s.db.writeDB.PrepareContext(ctx, `
-	INSERT OR IGNORE INTO deckbox_users(deckboxLogin, inventoryId, tradelistId, wishlistId)
-	VALUES (?, ?, ?, ?);`)
+	INSERT INTO deckbox_users(deckboxLogin, inventoryId, tradelistId, wishlistId)
+	VALUES (?, ?, ?, ?)
+	ON CONFLICT(deckboxLogin) DO UPDATE SET
+		inventoryId = excluded.inventoryId,
+		tradelistId = excluded.tradelistId,
+		wishlistId  = excluded.wishlistId;`)
 	if err != nil {
 		return fmt.Errorf("%s: %w", op, err)
 	}
 	defer stmt.Close()
 
 	_, err = stmt.Exec(user.DeckboxLogin, user.InventoryID, user.TradelistID, user.WishlistID)
-	if err != nil {
-		return fmt.Errorf("%s: %w", op, err)
-	}
-
-	stmt, err = s.db.writeDB.PrepareContext(ctx, `UPDATE deckbox_users
-	SET inventoryId = ?, tradelistId = ?, wishlistId = ?
-	WHERE deckboxLogin = ?
-	`)
-	if err != nil {
-		return fmt.Errorf("%s: %w", op, err)
-	}
-	defer stmt.Close()
-
-	_, err = stmt.Exec(user.InventoryID, user.TradelistID, user.WishlistID, user.DeckboxLogin)
 	if err != nil {
 		return fmt.Errorf("%s: %w", op, err)
 	}
@@ -459,10 +449,12 @@ func (s *SQLiteStorage) SearchCard(ctx context.Context, cardName string, scope s
 		if matchQuery != "" {
 			// Match against normalized column to support accent-insensitive matching
 			sqlStmt := fmt.Sprintf(`
-			SELECT cl.listId, cl.cardName COLLATE NOCASE, cl.quantity
+			SELECT cl.listId, cl.cardName COLLATE NOCASE, cl.quantity,
+			       du.deckboxLogin, u.telegramId, u.username
 			FROM card_lists AS cl
 			JOIN card_lists_fts AS fts ON cl.listId = fts.listId AND cl.cardName = fts.cardName
 			JOIN deckbox_users AS du ON cl.listId = du.%s
+			LEFT JOIN users AS u ON du.deckboxLogin = u.deckboxLogin
 			WHERE fts.cardName_normalized MATCH ?
 			ORDER BY cl.listId ASC, cl.cardName ASC
 			`, column)
@@ -483,10 +475,12 @@ func (s *SQLiteStorage) SearchCard(ctx context.Context, cardName string, scope s
 
 	if rows == nil {
 		sqlStmt := fmt.Sprintf(`
-		SELECT cl.listId, cl.cardName COLLATE NOCASE, cl.quantity
+		SELECT cl.listId, cl.cardName COLLATE NOCASE, cl.quantity,
+		       du.deckboxLogin, u.telegramId, u.username
 		FROM card_lists AS cl
-		LEFT JOIN deckbox_users AS du ON cl.listId = du.%s
-		WHERE du.deckboxLogin IS NOT NULL AND cl.cardName LIKE ?
+		JOIN deckbox_users AS du ON cl.listId = du.%s
+		LEFT JOIN users AS u ON du.deckboxLogin = u.deckboxLogin
+		WHERE cl.cardName LIKE ?
 		ORDER BY cl.listId ASC, cl.cardName ASC
 		`, column)
 
@@ -508,15 +502,21 @@ func (s *SQLiteStorage) SearchCard(ctx context.Context, cardName string, scope s
 		var listId int64
 		var cardName string
 		var quantity int16
-		err := rows.Scan(&listId, &cardName, &quantity)
+		var deckboxLogin string
+		var telegramId *int64
+		var username *string
+		err := rows.Scan(&listId, &cardName, &quantity, &deckboxLogin, &telegramId, &username)
 		if err != nil {
 			return nil, fmt.Errorf("%s: %w", op, err)
 		}
 
 		results = append(results, dto.CardSearchDTO{
-			ListId:   listId,
-			CardName: cardName,
-			Quantity: quantity,
+			ListId:           listId,
+			CardName:         cardName,
+			Quantity:         quantity,
+			DeckboxLogin:     deckboxLogin,
+			TelegramID:       telegramId,
+			TelegramUsername: username,
 		})
 	}
 

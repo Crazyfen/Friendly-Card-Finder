@@ -8,6 +8,8 @@ import (
 	"testing"
 )
 
+// Ensure context is used via mockOwnerStorage method signatures.
+
 // --- CardList ---
 
 func TestCardListAddCard(t *testing.T) {
@@ -88,15 +90,12 @@ func (m *mockOwnerStorage) GetAllDeckboxUsersWithOldLists(ctx context.Context, t
 }
 
 func TestMessageFormatter(t *testing.T) {
-	ctx := context.Background()
-	storage := &mockOwnerStorage{}
-
 	t.Run("no results contains query", func(t *testing.T) {
 		result := deckbox.SearchCardResult{
 			SearchQuery:   "Counterspell",
 			SearchResults: nil,
 		}
-		msg := result.FormatForTelegram(ctx, storage, "en", deckbox.ScopeTradelist)
+		msg := result.FormatForTelegram("en", deckbox.ScopeTradelist)
 		if !strings.Contains(msg, "Counterspell") {
 			t.Errorf("expected query in no-results message, got: %q", msg)
 		}
@@ -107,24 +106,23 @@ func TestMessageFormatter(t *testing.T) {
 			SearchQuery:   "Black Lotus",
 			SearchResults: nil,
 		}
-		msg := result.FormatForTelegram(ctx, storage, "en", deckbox.ScopeWishlist)
+		msg := result.FormatForTelegram("en", deckbox.ScopeWishlist)
 		if !strings.Contains(msg, "Black Lotus") {
 			t.Errorf("expected query in no-results message, got: %q", msg)
 		}
 	})
 
 	t.Run("with results contains card name", func(t *testing.T) {
-		storage.ownerFn = func(_ context.Context, listId int64) (*deckbox.CardListOwnerInfo, error) {
-			login := "trader1"
-			return &deckbox.CardListOwnerInfo{DeckboxLogin: login}, nil
-		}
 		result := deckbox.SearchCardResult{
 			SearchQuery: "Bolt",
-			SearchResults: []deckbox.CardList{
-				{ListId: 10, Cards: map[string]int16{"Lightning Bolt": 4}},
+			SearchResults: []deckbox.CardListWithOwner{
+				{
+					CardList:     deckbox.CardList{ListId: 10, Cards: map[string]int16{"Lightning Bolt": 4}},
+					DeckboxLogin: "trader1",
+				},
 			},
 		}
-		msg := result.FormatForTelegram(ctx, storage, "en", deckbox.ScopeTradelist)
+		msg := result.FormatForTelegram("en", deckbox.ScopeTradelist)
 		if !strings.Contains(msg, "Lightning Bolt") {
 			t.Errorf("expected card name in result message, got: %q", msg)
 		}
@@ -136,20 +134,18 @@ func TestMessageFormatter(t *testing.T) {
 	t.Run("with telegram user includes tg link", func(t *testing.T) {
 		tgID := int64(12345)
 		tgUser := "alice"
-		storage.ownerFn = func(_ context.Context, listId int64) (*deckbox.CardListOwnerInfo, error) {
-			return &deckbox.CardListOwnerInfo{
-				DeckboxLogin:     "alice_db",
-				TelegramID:       &tgID,
-				TelegramUsername: &tgUser,
-			}, nil
-		}
 		result := deckbox.SearchCardResult{
 			SearchQuery: "Shock",
-			SearchResults: []deckbox.CardList{
-				{ListId: 20, Cards: map[string]int16{"Shock": 1}},
+			SearchResults: []deckbox.CardListWithOwner{
+				{
+					CardList:         deckbox.CardList{ListId: 20, Cards: map[string]int16{"Shock": 1}},
+					DeckboxLogin:     "alice_db",
+					TelegramID:       &tgID,
+					TelegramUsername: &tgUser,
+				},
 			},
 		}
-		msg := result.FormatForTelegram(ctx, storage, "en", deckbox.ScopeTradelist)
+		msg := result.FormatForTelegram("en", deckbox.ScopeTradelist)
 		if !strings.Contains(msg, "alice") {
 			t.Errorf("expected telegram username in result, got: %q", msg)
 		}
