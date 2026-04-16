@@ -131,6 +131,107 @@ func TestMessageFormatter(t *testing.T) {
 		}
 	})
 
+	t.Run("multi-card grouped format", func(t *testing.T) {
+		tgID := int64(42)
+		tgUser := "alice"
+		result := deckbox.MultiCardSearchResult{
+			SearchQueries: []string{"Bolt", "Shock", "Lava Spike"},
+			Aggregates: []deckbox.UserSearchAggregate{
+				{
+					ListId:           100,
+					DeckboxLogin:     "alice_db",
+					TelegramID:       &tgID,
+					TelegramUsername: &tgUser,
+					FoundCards:       map[string]int16{"Bolt": 4, "Shock": 2, "Lava Spike": 1},
+					UniqueCount:      3,
+					TotalQuantity:    7,
+				},
+				{
+					ListId:        200,
+					DeckboxLogin:  "bob",
+					FoundCards:    map[string]int16{"Bolt": 2},
+					UniqueCount:   1,
+					TotalQuantity: 2,
+				},
+			},
+			NotFound: []string{"Force of Will"},
+		}
+		main, notFound := result.FormatForTelegram("en", deckbox.ScopeTradelist)
+
+		if !strings.Contains(main, "alice_db") || !strings.Contains(main, "bob") {
+			t.Errorf("main must mention both owners, got: %q", main)
+		}
+		if !strings.Contains(main, "3/3") || !strings.Contains(main, "1/3") {
+			t.Errorf("main must contain uniqueCount/totalQueried headers, got: %q", main)
+		}
+		if strings.Index(main, "alice_db") > strings.Index(main, "bob") {
+			t.Errorf("alice (higher UniqueCount) must come before bob, got: %q", main)
+		}
+		if !strings.Contains(main, "@alice") {
+			t.Errorf("expected telegram mention, got: %q", main)
+		}
+		if notFound == "" || !strings.Contains(notFound, "Force of Will") {
+			t.Errorf("expected not-found message, got: %q", notFound)
+		}
+	})
+
+	t.Run("multi-card all found returns empty notFound", func(t *testing.T) {
+		result := deckbox.MultiCardSearchResult{
+			SearchQueries: []string{"Bolt"},
+			Aggregates: []deckbox.UserSearchAggregate{
+				{
+					ListId:        1,
+					DeckboxLogin:  "a",
+					FoundCards:    map[string]int16{"Bolt": 1},
+					UniqueCount:   1,
+					TotalQuantity: 1,
+				},
+			},
+		}
+		_, notFound := result.FormatForTelegram("en", deckbox.ScopeTradelist)
+		if notFound != "" {
+			t.Errorf("expected empty notFound, got: %q", notFound)
+		}
+	})
+
+	t.Run("multi-card all not found returns no-results main", func(t *testing.T) {
+		result := deckbox.MultiCardSearchResult{
+			SearchQueries: []string{"A", "B"},
+			Aggregates:    nil,
+			NotFound:      []string{"A", "B"},
+		}
+		main, notFound := result.FormatForTelegram("en", deckbox.ScopeTradelist)
+		if !strings.Contains(main, "No results") && !strings.Contains(main, "2") {
+			t.Errorf("expected no-results header referencing count, got: %q", main)
+		}
+		if notFound != "" {
+			t.Errorf("when everything not found, main carries the message; notFound should stay empty, got: %q", notFound)
+		}
+	})
+
+	t.Run("multi-card wishlist scope uses sell keys", func(t *testing.T) {
+		result := deckbox.MultiCardSearchResult{
+			SearchQueries: []string{"A", "B"},
+			NotFound:      []string{"A"},
+			Aggregates: []deckbox.UserSearchAggregate{
+				{
+					ListId:        1,
+					DeckboxLogin:  "x",
+					FoundCards:    map[string]int16{"B": 1},
+					UniqueCount:   1,
+					TotalQuantity: 1,
+				},
+			},
+		}
+		main, notFound := result.FormatForTelegram("en", deckbox.ScopeWishlist)
+		if !strings.Contains(main, "Wishlist") {
+			t.Errorf("wishlist scope should use sell header, got: %q", main)
+		}
+		if !strings.Contains(notFound, "wishlist") {
+			t.Errorf("wishlist not-found should mention wishlist, got: %q", notFound)
+		}
+	})
+
 	t.Run("with telegram user includes tg link", func(t *testing.T) {
 		tgID := int64(12345)
 		tgUser := "alice"

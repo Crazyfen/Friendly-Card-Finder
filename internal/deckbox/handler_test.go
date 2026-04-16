@@ -15,6 +15,7 @@ type fakeStorage struct {
 	saveCardListErr       error
 	getDeckboxUserFn      func(ctx context.Context, login string) (*DeckboxUser, error)
 	searchCardResults     []dto.CardSearchDTO
+	searchCardFn          func(cardName string) []dto.CardSearchDTO
 }
 
 func (f *fakeStorage) RegisterUser(ctx context.Context, user BotUser) error        { return nil }
@@ -24,6 +25,9 @@ func (f *fakeStorage) SaveCardList(ctx context.Context, list CardList) error {
 }
 func (f *fakeStorage) ClearCardList(ctx context.Context, listId int64) error { return nil }
 func (f *fakeStorage) SearchCard(ctx context.Context, cardName string, scope string) ([]dto.CardSearchDTO, error) {
+	if f.searchCardFn != nil {
+		return f.searchCardFn(cardName), nil
+	}
 	return f.searchCardResults, nil
 }
 func (f *fakeStorage) GetOwnerByListId(ctx context.Context, listId int64) (*CardListOwnerInfo, error) {
@@ -187,6 +191,120 @@ func TestSearchCardEmpty(t *testing.T) {
 	}
 	if result.SearchQuery != "Nonexistent" {
 		t.Errorf("expected query preserved, got %q", result.SearchQuery)
+	}
+}
+
+// --- SearchCards (multi-card aggregation) ---
+
+func TestSearchCardsAggregatesByListId(t *testing.T) {
+	// list 1 has both cards; list 2 has only Bolt.
+	storage := &fakeStorage{
+		searchCardFn: func(cardName string) []dto.CardSearchDTO {
+			switch cardName {
+			case "Bolt":
+				return []dto.CardSearchDTO{
+					{ListId: 1, DeckboxLogin: "alice", CardName: "Bolt", Quantity: 4},
+					{ListId: 2, DeckboxLogin: "bob", CardName: "Bolt", Quantity: 2},
+				}
+			case "Shock":
+				return []dto.CardSearchDTO{
+					{ListId: 1, DeckboxLogin: "alice", CardName: "Shock", Quantity: 3},
+				}
+			}
+			return nil
+		},
+	}
+
+	result, err := SearchCards(context.Background(), slog.Default(), storage, []string{"Bolt", "Shock"}, ScopeTradelist)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(result.Aggregates) != 2 {
+		t.Fatalf("expected 2 aggregates, got %d", len(result.Aggregates))
+	}
+	// Alice (unique=2, total=7) first; Bob (unique=1, total=2) second.
+	if result.Aggregates[0].DeckboxLogin != "alice" {
+		t.Errorf("expected alice first, got %q", result.Aggregates[0].DeckboxLogin)
+	}
+	if result.Aggregates[0].UniqueCount != 2 || result.Aggregates[0].TotalQuantity != 7 {
+		t.Errorf("alice: want unique=2 total=7, got unique=%d total=%d",
+			result.Aggregates[0].UniqueCount, result.Aggregates[0].TotalQuantity)
+	}
+	if result.Aggregates[1].DeckboxLogin != "bob" {
+		t.Errorf("expected bob second, got %q", result.Aggregates[1].DeckboxLogin)
+	}
+	if result.Aggregates[1].UniqueCount != 1 || result.Aggregates[1].TotalQuantity != 2 {
+		t.Errorf("bob: want unique=1 total=2, got unique=%d total=%d",
+			result.Aggregates[1].UniqueCount, result.Aggregates[1].TotalQuantity)
+	}
+}
+
+func TestSearchCardsTracksNotFound(t *testing.T) {
+	storage := &fakeStorage{
+		searchCardFn: func(cardName string) []dto.CardSearchDTO {
+			if cardName == "Bolt" {
+				return []dto.CardSearchDTO{{ListId: 1, DeckboxLogin: "alice", CardName: "Bolt", Quantity: 1}}
+			}
+			return nil
+		},
+	}
+	result, err := SearchCards(context.Background(), slog.Default(), storage, []string{"Bolt", "Force of Will", "Black Lotus"}, ScopeTradelist)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(result.NotFound) != 2 {
+		t.Fatalf("expected 2 not-found entries, got %d", len(result.NotFound))
+	}
+	if result.NotFound[0] != "Force of Will" || result.NotFound[1] != "Black Lotus" {
+		t.Errorf("expected order preserved, got %v", result.NotFound)
+	}
+}
+
+func TestSearchCardsSortOrder(t *testing.T) {
+	// Three lists: A (unique=1, total=10), B (unique=2, total=3), C (unique=2, total=5).
+	// Expected: C, B, A — unique DESC then total DESC.
+	storage := &fakeStorage{
+		searchCardFn: func(cardName string) []dto.CardSearchDTO {
+			switch cardName {
+			case "X":
+				return []dto.CardSearchDTO{
+					{ListId: 1, DeckboxLogin: "a", CardName: "X", Quantity: 10},
+					{ListId: 2, DeckboxLogin: "b", CardName: "X", Quantity: 1},
+					{ListId: 3, DeckboxLogin: "c", CardName: "X", Quantity: 1},
+				}
+			case "Y":
+				return []dto.CardSearchDTO{
+					{ListId: 2, DeckboxLogin: "b", CardName: "Y", Quantity: 2},
+					{ListId: 3, DeckboxLogin: "c", CardName: "Y", Quantity: 4},
+				}
+			}
+			return nil
+		},
+	}
+	result, err := SearchCards(context.Background(), slog.Default(), storage, []string{"X", "Y"}, ScopeTradelist)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	got := []string{result.Aggregates[0].DeckboxLogin, result.Aggregates[1].DeckboxLogin, result.Aggregates[2].DeckboxLogin}
+	want := []string{"c", "b", "a"}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("order[%d]: want %q, got %q (full: %v)", i, want[i], got[i], got)
+		}
+	}
+}
+
+func TestSearchCardsAllNotFound(t *testing.T) {
+	storage := &fakeStorage{} // returns nil for any card
+	result, err := SearchCards(context.Background(), slog.Default(), storage, []string{"A", "B"}, ScopeTradelist)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(result.Aggregates) != 0 {
+		t.Errorf("expected no aggregates, got %d", len(result.Aggregates))
+	}
+	if len(result.NotFound) != 2 {
+		t.Errorf("expected 2 not-found, got %d", len(result.NotFound))
 	}
 }
 

@@ -110,24 +110,7 @@ func (a *App) defaultHandler(ctx context.Context, b *bot.Bot, update *models.Upd
 	log.Info("handling default message")
 
 	lang := i18n.DetectLang(update.Message.From.LanguageCode)
-
-	for line := range strings.SplitSeq(update.Message.Text, "\n") {
-		line = strings.TrimSpace(line)
-		if line == "" {
-			continue
-		}
-		log.Info("card to search", slog.String("line", line))
-
-		result, err := deckbox.SearchCard(ctx, log, a.storage, line, deckbox.ScopeTradelist)
-		if err != nil {
-			log.Error("failed to search card", sl.Err(err))
-			continue
-		}
-
-		message := result.FormatForTelegram(lang, deckbox.ScopeTradelist)
-		log.Info("sending card search response", slog.String("message", message))
-		sendHTMLReply(ctx, b, update.Message.Chat.ID, int(update.Message.ID), message, log)
-	}
+	a.searchAndReply(ctx, b, log, lang, update.Message.Text, update.Message.Chat.ID, int(update.Message.ID), deckbox.ScopeTradelist)
 }
 
 func (a *App) startHandler(ctx context.Context, b *bot.Bot, update *models.Update) {
@@ -239,20 +222,42 @@ func (a *App) sellHandler(ctx context.Context, b *bot.Bot, update *models.Update
 		return
 	}
 
-	for l := range strings.SplitSeq(argument, "\n") {
-		line := strings.TrimSpace(l)
-		if line == "" {
-			continue
-		}
+	a.searchAndReply(ctx, b, log, lang, argument, update.Message.Chat.ID, int(update.Message.ID), deckbox.ScopeWishlist)
+}
 
-		result, err := deckbox.SearchCard(ctx, log, a.storage, line, deckbox.ScopeWishlist)
+// searchAndReply parses one-card-per-line input and replies either with the
+// single-card format (1 card) or the grouped multi-card format (>1 cards).
+func (a *App) searchAndReply(ctx context.Context, b *bot.Bot, log *slog.Logger, lang, text string, chatID int64, replyToID int, scope string) {
+	var cards []string
+	for line := range strings.SplitSeq(text, "\n") {
+		line = strings.TrimSpace(line)
+		if line != "" {
+			cards = append(cards, line)
+		}
+	}
+	if len(cards) == 0 {
+		return
+	}
+
+	if len(cards) == 1 {
+		result, err := deckbox.SearchCard(ctx, log, a.storage, cards[0], scope)
 		if err != nil {
 			log.Error("failed to search card", sl.Err(err))
-			continue
+			return
 		}
+		sendHTMLReply(ctx, b, chatID, replyToID, result.FormatForTelegram(lang, scope), log)
+		return
+	}
 
-		message := result.FormatForTelegram(lang, deckbox.ScopeWishlist)
-		sendHTMLReply(ctx, b, update.Message.Chat.ID, int(update.Message.ID), message, log)
+	result, err := deckbox.SearchCards(ctx, log, a.storage, cards, scope)
+	if err != nil {
+		log.Error("failed to search cards", sl.Err(err))
+		return
+	}
+	mainMsg, notFoundMsg := result.FormatForTelegram(lang, scope)
+	sendHTMLReply(ctx, b, chatID, replyToID, mainMsg, log)
+	if notFoundMsg != "" {
+		sendHTMLReply(ctx, b, chatID, replyToID, notFoundMsg, log)
 	}
 }
 

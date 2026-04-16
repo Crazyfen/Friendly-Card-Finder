@@ -6,6 +6,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -302,6 +303,68 @@ func SearchCard(ctx context.Context, log *slog.Logger, storage DeckboxSaver, car
 	}
 
 	return SearchCardResult{SearchQuery: cardName, SearchResults: searchResults}, nil
+}
+
+// SearchCards searches each cardName and aggregates results by ListId across all
+// queries. Used when the user sends multiple cards in one message so we can show
+// which owner has the most overlap with the requested set.
+func SearchCards(ctx context.Context, log *slog.Logger, storage DeckboxSaver, cardNames []string, scope string) (MultiCardSearchResult, error) {
+	const op = "handlers.deckbox.SearchCards"
+	log = log.With(slog.String("operation", op), slog.Int("card_count", len(cardNames)), slog.String("scope", scope))
+
+	result := MultiCardSearchResult{SearchQueries: cardNames}
+	aggregates := make(map[int64]*UserSearchAggregate)
+
+	for _, name := range cardNames {
+		scr, err := SearchCard(ctx, log, storage, name, scope)
+		if err != nil {
+			return MultiCardSearchResult{}, err
+		}
+		if len(scr.SearchResults) == 0 {
+			result.NotFound = append(result.NotFound, name)
+			continue
+		}
+		for _, cl := range scr.SearchResults {
+			agg, ok := aggregates[cl.ListId]
+			if !ok {
+				agg = &UserSearchAggregate{
+					ListId:           cl.ListId,
+					DeckboxLogin:     cl.DeckboxLogin,
+					TelegramID:       cl.TelegramID,
+					TelegramUsername: cl.TelegramUsername,
+					FoundCards:       make(map[string]int16),
+				}
+				aggregates[cl.ListId] = agg
+			}
+			for cardName, qty := range cl.Cards {
+				agg.FoundCards[cardName] += qty
+			}
+		}
+	}
+
+	result.Aggregates = make([]UserSearchAggregate, 0, len(aggregates))
+	for _, agg := range aggregates {
+		agg.UniqueCount = len(agg.FoundCards)
+		total := 0
+		for _, qty := range agg.FoundCards {
+			total += int(qty)
+		}
+		agg.TotalQuantity = total
+		result.Aggregates = append(result.Aggregates, *agg)
+	}
+
+	sort.Slice(result.Aggregates, func(i, j int) bool {
+		a, b := result.Aggregates[i], result.Aggregates[j]
+		if a.UniqueCount != b.UniqueCount {
+			return a.UniqueCount > b.UniqueCount
+		}
+		if a.TotalQuantity != b.TotalQuantity {
+			return a.TotalQuantity > b.TotalQuantity
+		}
+		return a.DeckboxLogin < b.DeckboxLogin
+	})
+
+	return result, nil
 }
 
 type SuggestDeckboxResult struct {

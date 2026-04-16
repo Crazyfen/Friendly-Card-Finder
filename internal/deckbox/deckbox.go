@@ -7,6 +7,7 @@ import (
 	b64 "encoding/base64"
 	"fmt"
 	"log/slog"
+	"sort"
 	"strings"
 
 	"github.com/go-telegram/bot/models"
@@ -47,6 +48,22 @@ type CardListWithOwner struct {
 type SearchCardResult struct {
 	SearchQuery   string
 	SearchResults []CardListWithOwner
+}
+
+type UserSearchAggregate struct {
+	ListId           int64
+	DeckboxLogin     string
+	TelegramID       *int64
+	TelegramUsername *string
+	FoundCards       map[string]int16
+	UniqueCount      int
+	TotalQuantity    int
+}
+
+type MultiCardSearchResult struct {
+	SearchQueries []string
+	Aggregates    []UserSearchAggregate
+	NotFound      []string
 }
 
 const (
@@ -121,6 +138,59 @@ func (scr *SearchCardResult) FormatForTelegram(lang string, scope string) string
 	}
 
 	return response.String()
+}
+
+// FormatForTelegram returns (mainMessage, notFoundMessage). The second string is
+// empty when every queried card was found at least once.
+func (m *MultiCardSearchResult) FormatForTelegram(lang string, scope string) (string, string) {
+	noResultsKey := "search.multi_no_results"
+	headerKey := "search.multi_results_header"
+	notFoundKey := "search.multi_not_found"
+	if scope == ScopeWishlist {
+		noResultsKey = "sell.multi_no_results"
+		headerKey = "sell.multi_results_header"
+		notFoundKey = "sell.multi_not_found"
+	}
+
+	totalQueried := len(m.SearchQueries)
+
+	var notFoundMsg string
+	if len(m.NotFound) > 0 {
+		notFoundMsg = fmt.Sprintf(i18n.T(lang, notFoundKey), strings.Join(m.NotFound, ", "))
+	}
+
+	if len(m.Aggregates) == 0 {
+		return fmt.Sprintf(i18n.T(lang, noResultsKey), totalQueried), ""
+	}
+
+	var response strings.Builder
+	response.WriteString(fmt.Sprintf(i18n.T(lang, headerKey), totalQueried))
+
+	for _, agg := range m.Aggregates {
+		linkURL := fmt.Sprintf("https://deckbox.org/sets/%d", agg.ListId)
+		response.WriteString(fmt.Sprintf(i18n.T(lang, "search.deckbox_link"), linkURL, agg.DeckboxLogin))
+
+		if agg.TelegramID != nil && agg.TelegramUsername != nil {
+			fmt.Fprintf(&response, " у <a href=\"tg://user?id=%d\">@%v</a>", *agg.TelegramID, *agg.TelegramUsername)
+		}
+		fmt.Fprintf(&response, i18n.T(lang, "search.multi_user_header"), agg.UniqueCount, totalQueried)
+
+		for _, cardName := range sortedCardNames(agg.FoundCards) {
+			response.WriteString(fmt.Sprintf("  %s: %d\n", cardName, agg.FoundCards[cardName]))
+		}
+		response.WriteString("\n")
+	}
+
+	return strings.TrimRight(response.String(), "\n"), notFoundMsg
+}
+
+func sortedCardNames(cards map[string]int16) []string {
+	names := make([]string, 0, len(cards))
+	for name := range cards {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
 }
 
 func (cl *CardList) GetCardQuantity(cardName string) (int16, error) {

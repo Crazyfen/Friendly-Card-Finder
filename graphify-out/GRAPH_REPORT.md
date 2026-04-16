@@ -1,11 +1,11 @@
-# Graph Report - .  (2026-04-13)
+# Graph Report - .  (2026-04-17)
 
 ## Corpus Check
-- 16 files · ~12,430 words
+- 16 files · ~14,385 words
 - Verdict: corpus is large enough that graph structure adds value.
 
 ## Summary
-- 168 nodes · 200 edges · 17 communities detected
+- 178 nodes · 213 edges · 17 communities detected
 - Extraction: 98% EXTRACTED · 2% INFERRED · 0% AMBIGUOUS · INFERRED: 5 edges (avg confidence: 0.8)
 - Token cost: 0 input · 0 output
 
@@ -33,9 +33,9 @@
 2. `mockOwnerStorage` - 10 edges
 3. `fakeStorage` - 10 edges
 4. `FriendlyCardFinder` - 10 edges
-5. `newTestDB()` - 7 edges
-6. `Environment Configuration (.env)` - 7 edges
-7. `App` - 6 edges
+5. `App` - 7 edges
+6. `newTestDB()` - 7 edges
+7. `Environment Configuration (.env)` - 7 edges
 8. `internal/storage/sqlite Package` - 6 edges
 9. `Deckbox Scraper (scrapper.go)` - 6 edges
 10. `FTS5 Full-Text Search` - 5 edges
@@ -52,7 +52,7 @@
 ## Communities
 
 ### Community 0 - "Community 0"
-Cohesion: 0.09
+Cohesion: 0.08
 Nodes (5): fakeScraper, fakeStorage, TestSearchCardEmpty(), TestSearchCardGroupsByListId(), TestSearchCardSameCardAcrossLists()
 
 ### Community 1 - "Community 1"
@@ -60,8 +60,8 @@ Cohesion: 0.12
 Nodes (23): BOT_TOKEN Env Var, Deckbox.org, internal/deckbox Package, DeckboxSaver Interface (mock), DECKBOX_SESSION_COOKIE Env Var, Docker / docker-compose, Environment Configuration (.env), ENV Var (log level) (+15 more)
 
 ### Community 2 - "Community 2"
-Cohesion: 0.11
-Nodes (9): BotUser, CardList, CardListOwnerInfo, CardListWithOwner, DeckboxSaver, DeckboxUser, Scraper, SearchCardResult (+1 more)
+Cohesion: 0.1
+Nodes (12): BotUser, CardList, CardListOwnerInfo, CardListWithOwner, DeckboxSaver, DeckboxUser, MultiCardSearchResult, Scraper (+4 more)
 
 ### Community 3 - "Community 3"
 Cohesion: 0.22
@@ -76,15 +76,15 @@ Cohesion: 0.14
 Nodes (1): mockOwnerStorage
 
 ### Community 6 - "Community 6"
-Cohesion: 0.24
-Nodes (10): profileFetcher, refreshResult, SuggestDeckboxResult, GetProfileData(), NewUser(), RefreshStaleUserLists(), refreshUserListsWorker(), runUserRefreshWorkerPool() (+2 more)
+Cohesion: 0.23
+Nodes (12): profileFetcher, refreshResult, SuggestDeckboxResult, GetProfileData(), NewUser(), RefreshStaleUserLists(), refreshUserListsWorker(), runUserRefreshWorkerPool() (+4 more)
 
 ### Community 7 - "Community 7"
 Cohesion: 0.2
 Nodes (12): Batch Insert Strategy (~1000 cards), CARD_LIST_BATCH_SIZE Env Var, card_lists_fts Virtual Table, Dual DB Connections (read/write split), FTS5 Full-Text Search, github.com/mattn/go-sqlite3 Driver, Rationale: Batch inserts avoid SQLite param limit, Rationale: Separate read/write connections for concurrency (+4 more)
 
 ### Community 8 - "Community 8"
-Cohesion: 0.27
+Cohesion: 0.25
 Nodes (4): App, main(), sendHTMLReply(), setupLogger()
 
 ### Community 9 - "Community 9"
@@ -120,7 +120,7 @@ Cohesion: 1.0
 Nodes (0): 
 
 ## Knowledge Gaps
-- **25 isolated node(s):** `Config`, `BotUser`, `DeckboxUser`, `CardListOwnerInfo`, `CardListWithOwner` (+20 more)
+- **26 isolated node(s):** `Config`, `BotUser`, `DeckboxUser`, `CardListOwnerInfo`, `CardListWithOwner` (+21 more)
   These have ≤1 connection - possible missing edges or undocumented components.
 - **Thin community `Community 13`** (2 nodes): `CardSearchDTO`, `dto.go`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
@@ -135,16 +135,16 @@ Nodes (0):
 _Questions this graph is uniquely positioned to answer:_
 
 - **Why does `FriendlyCardFinder` connect `Community 1` to `Community 7`?**
-  _High betweenness centrality (0.025) - this node is a cross-community bridge._
+  _High betweenness centrality (0.022) - this node is a cross-community bridge._
 - **Why does `Environment Configuration (.env)` connect `Community 1` to `Community 7`?**
-  _High betweenness centrality (0.012) - this node is a cross-community bridge._
+  _High betweenness centrality (0.011) - this node is a cross-community bridge._
 - **What connects `Config`, `BotUser`, `DeckboxUser` to the rest of the system?**
-  _25 weakly-connected nodes found - possible documentation gaps or missing edges._
+  _26 weakly-connected nodes found - possible documentation gaps or missing edges._
 - **Should `Community 0` be split into smaller, more focused modules?**
-  _Cohesion score 0.09 - nodes in this community are weakly interconnected._
+  _Cohesion score 0.08 - nodes in this community are weakly interconnected._
 - **Should `Community 1` be split into smaller, more focused modules?**
   _Cohesion score 0.12 - nodes in this community are weakly interconnected._
 - **Should `Community 2` be split into smaller, more focused modules?**
-  _Cohesion score 0.11 - nodes in this community are weakly interconnected._
+  _Cohesion score 0.1 - nodes in this community are weakly interconnected._
 - **Should `Community 5` be split into smaller, more focused modules?**
   _Cohesion score 0.14 - nodes in this community are weakly interconnected._

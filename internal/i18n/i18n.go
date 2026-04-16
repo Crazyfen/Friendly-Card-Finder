@@ -34,9 +34,16 @@ var translations = map[string]map[string]string{
 		"search.no_results":            "По запросу: <b>%s</b> ничего не найдено.",
 		"search.results_header":        "По запросу: <b>%s</b> нашлось:\n",
 		"search.deckbox_link":          "В deckbox <a href=\"%s\">%s</a>",
+		"search.multi_no_results":      "По %d картам ничего не найдено.",
+		"search.multi_results_header":  "По %d картам нашлось:\n\n",
+		"search.multi_user_header":     " — %d/%d:\n",
+		"search.multi_not_found":       "Не найдено ни у кого: %s",
 		"sell.no_argument":             "Пожалуйста, укажи название карточки (по одной на строку) после команды /sell",
 		"sell.no_results":              "По запросу (в вишлистах): <b>%s</b> ничего не найдено.",
 		"sell.results_header":          "В вишлистах найдены совпадения для: <b>%s</b>:\n",
+		"sell.multi_no_results":        "По %d картам в вишлистах ничего не найдено.",
+		"sell.multi_results_header":    "В вишлистах найдены совпадения по %d картам:\n\n",
+		"sell.multi_not_found":         "Ни у кого нет в вишлисте: %s",
 	},
 	"en": {
 		"start.welcome": `<b>Hello!</b>
@@ -66,9 +73,16 @@ Results include links to Deckbox and, when available, a link to the Telegram use
 		"search.no_results":            "No results for: <b>%s</b>",
 		"search.results_header":        "Results for: <b>%s</b>:\n",
 		"search.deckbox_link":          `On deckbox <a href="%s">%s</a>`,
+		"search.multi_no_results":      "No results for any of the %d cards.",
+		"search.multi_results_header":  "Results for %d cards:\n\n",
+		"search.multi_user_header":     " — %d/%d:\n",
+		"search.multi_not_found":       "Not found anywhere: %s",
 		"sell.no_argument":             "Please provide a card name (one per line) after /sell",
 		"sell.no_results":              "No wishlist results for: <b>%s</b>",
 		"sell.results_header":          "Wishlist matches for: <b>%s</b>:\n",
+		"sell.multi_no_results":        "No wishlist results for any of the %d cards.",
+		"sell.multi_results_header":    "Wishlist matches for %d cards:\n\n",
+		"sell.multi_not_found":         "Nobody has in wishlist: %s",
 	},
 }
 
