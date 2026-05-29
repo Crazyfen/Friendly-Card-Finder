@@ -74,7 +74,12 @@ func main() {
 	app := &App{
 		log:     log,
 		storage: storage,
-		scraper: deckbox.NewScraper(log, cfg.DeckboxSessionCookie),
+		scraper: deckbox.NewScraper(log, deckbox.ScraperAuth{
+			Login:          cfg.DeckboxLogin,
+			Password:       cfg.DeckboxPassword,
+			CookieOverride: cfg.DeckboxSessionCookie,
+			CookiePath:     cfg.DeckboxCookiePath,
+		}),
 		cfg:     cfg,
 	}
 

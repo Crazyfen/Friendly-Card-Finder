@@ -7,8 +7,12 @@ import (
 	b64 "encoding/base64"
 	"fmt"
 	"log/slog"
+	"net/http"
+	"net/http/cookiejar"
 	"sort"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/go-telegram/bot/models"
 )
@@ -93,17 +97,49 @@ type DeckboxSaver interface {
 	GetAllDeckboxUsersWithOldLists(ctx context.Context, thresholdSeconds int64) ([]string, error)
 }
 
-// Scraper handles fetching data from Deckbox with embedded configuration
-type Scraper struct {
-	sessionCookie string
-	log           *slog.Logger
+// ScraperAuth holds the credentials and cookie configuration for the Scraper.
+// Either Login+Password (to log in) or CookieOverride (a manual _tcg_session value)
+// must be provided.
+type ScraperAuth struct {
+	Login          string
+	Password       string
+	CookieOverride string // DECKBOX_SESSION_COOKIE, optional; used verbatim if set
+	CookiePath     string // file where the obtained session cookie is persisted
 }
 
-// NewScraper creates a new Scraper instance with the provided session cookie and logger
-func NewScraper(log *slog.Logger, sessionCookie string) *Scraper {
+// Scraper handles fetching data from Deckbox with embedded configuration.
+type Scraper struct {
+	login          string
+	password       string
+	cookieOverride string
+	cookiePath     string
+	httpClient     *http.Client
+
+	mu            sync.Mutex // guards sessionCookie and serializes logins (single-flight)
+	sessionCookie string
+
+	log *slog.Logger
+}
+
+// NewScraper creates a new Scraper instance with the provided auth config and logger.
+func NewScraper(log *slog.Logger, auth ScraperAuth) *Scraper {
+	// Cookie jar is required so the CSRF-bound session cookie from the login GET
+	// is sent with the login POST. CheckRedirect stops on the success redirect so
+	// we can detect it (302) versus a failed login (200 re-rendering the form).
+	jar, _ := cookiejar.New(nil)
 	return &Scraper{
-		sessionCookie: sessionCookie,
-		log:           log,
+		login:          auth.Login,
+		password:       auth.Password,
+		cookieOverride: auth.CookieOverride,
+		cookiePath:     auth.CookiePath,
+		httpClient: &http.Client{
+			Jar:     jar,
+			Timeout: 30 * time.Second,
+			CheckRedirect: func(*http.Request, []*http.Request) error {
+				return http.ErrUseLastResponse
+			},
+		},
+		log: log,
 	}
 }
 

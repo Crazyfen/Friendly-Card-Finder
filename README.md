@@ -25,11 +25,14 @@ FriendlyCardFinder — Telegram-бот для поиска карточек Magi
 
 - `BOT_TOKEN` — токен Telegram-бота
 - `STORAGE_PATH` — путь к файлу SQLite базы (например `./data/db.sqlite`)
-- `DECKBOX_SESSION_COOKIE` — session cookie для доступа к Deckbox (нужен для интеграционных тестов и парсинга страниц)
+- `DECKBOX_LOGIN` + `DECKBOX_PASSWORD` — учётные данные Deckbox; бот сам логинится и получает session cookie (сохраняется в `<папка storage>/deckbox_session` и переиспользуется между перезапусками)
 - `ENV` — `local`/`dev`/`prod` (влияет на уровень логирования)
+
+Для доступа к Deckbox нужно задать **либо** `DECKBOX_LOGIN`+`DECKBOX_PASSWORD`, **либо** `DECKBOX_SESSION_COOKIE` (см. ниже).
 
 Дополнительные опции (необязательно):
 
+- `DECKBOX_SESSION_COOKIE` — ручной override значения `_tcg_session`; если задан, используется напрямую без логина
 - `FRESHNESS_TIME_LIMIT_HOURS` — время, после которого считаем данные "устаревшими" (по умолчанию в коде задаётся значение)
 - `CARD_LIST_BATCH_SIZE` — размер батча при вставке карточек в БД (по умолчанию 1000)
 
@@ -38,7 +41,8 @@ FriendlyCardFinder — Telegram-бот для поиска карточек Magi
 ```
 BOT_TOKEN=123456:ABCDEFG
 STORAGE_PATH=./data/db.sqlite
-DECKBOX_SESSION_COOKIE=your_cookie_here
+DECKBOX_LOGIN=your_email@example.com
+DECKBOX_PASSWORD=your_password
 ENV=local
 ```
 
@@ -79,7 +83,7 @@ FTS-тесты (требуют сборки драйвера с поддержк
 go test -tags "fts5" ./internal/storage/sqlite -v
 ```
 
-Интеграционные тесты, которые взаимодействуют с Deckbox, требуют корректного `DECKBOX_SESSION_COOKIE` в окружении и доступа в сеть.
+Интеграционные тесты, которые взаимодействуют с Deckbox, требуют авторизации (`DECKBOX_LOGIN`+`DECKBOX_PASSWORD` или override `DECKBOX_SESSION_COOKIE`) в окружении и доступа в сеть; иначе они пропускаются.
 
 **Особенности реализации и советы для разработчиков**
 
@@ -123,7 +127,7 @@ docker compose up -d
 | `SSH_USER`        | Пользователь SSH                             |
 | `SSH_PRIVATE_KEY` | Приватный SSH-ключ (полное содержимое файла) |
 
-`.env` на VPS с `BOT_TOKEN`, `STORAGE_PATH`, `DECKBOX_SESSION_COOKIE`, `ENV` необходимо создать вручную один раз в директории `~/friendlycardfinder/`.
+`.env` на VPS с `BOT_TOKEN`, `STORAGE_PATH`, `DECKBOX_LOGIN`, `DECKBOX_PASSWORD`, `ENV` необходимо создать вручную один раз в директории `~/friendlycardfinder/`.
 
 **Контакты и вклад**
 

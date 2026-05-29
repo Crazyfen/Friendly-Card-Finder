@@ -28,7 +28,7 @@ go test ./internal/storage/sqlite -run TestSaveCardListBatching -v
 go test -race ./...
 ```
 
-FTS5 tests skip automatically when the driver lacks FTS5 support. Scraper integration tests (`scrapper_test.go`) need a valid `DECKBOX_SESSION_COOKIE` and network access.
+FTS5 tests skip automatically when the driver lacks FTS5 support. Scraper integration tests (`scrapper_test.go`) need deckbox auth (`DECKBOX_LOGIN`+`DECKBOX_PASSWORD`, or a `DECKBOX_SESSION_COOKIE` override) and network access; they skip otherwise. The offline scraper unit tests (`parseAuthenticityToken`, cookie file round-trip) always run.
 
 ## Architecture
 
@@ -38,7 +38,7 @@ internal/
   config/config.go           .env loading (MustLoad panics on missing required vars)
   deckbox/
     deckbox.go               Domain types + DeckboxSaver interface
-    scrapper.go              Colly-based HTML scraper
+    scrapper.go              Colly-based HTML scraper + Deckbox login/cookie auth
     handler.go               NewUser, SearchCard, RefreshStaleUserLists, SuggestDeckbox
   storage/sqlite/sqlite.go   SQLite implementation of DeckboxSaver
   i18n/i18n.go               RU/EN translations via T(lang, key)
@@ -59,6 +59,10 @@ env/env.go                   EnvKey type + godotenv Load()
 - **WAL mode**: `PRAGMA journal_mode=WAL`, `synchronous=NORMAL`, `busy_timeout=5000`
 - **Batch inserts**: `SaveCardList` batches 1,000 cards per transaction (SQLite 32,766 param limit; 3 params/card → ~10,922 max per statement)
 - **FTS5**: virtual table `card_lists_fts` with `cardName_normalized` (NFD accent-stripped) for accent-insensitive prefix search; falls back to `LIKE` if unavailable
+
+### Scraper auth
+
+`Scraper` resolves the Deckbox `_tcg_session` cookie lazily in this order: in-memory cache → `DECKBOX_SESSION_COOKIE` override → persisted file (`<storage dir>/deckbox_session`, `0600`) → fresh login. `doLogin` GETs `/accounts/login` (cookie jar captures the session cookie, `parseAuthenticityToken` scrapes the Rails CSRF token), then POSTs credentials (302 = success). `FetchCardList` detects a rejected cookie (response is the login page) and calls `refreshCookie` to re-login once. A `sync.Mutex` serializes logins (single-flight) so the worker pools don't all authenticate at once.
 
 ### Worker pool
 
@@ -88,8 +92,12 @@ env/env.go                   EnvKey type + godotenv Load()
 |---|---|---|---|
 | `BOT_TOKEN` | yes | — | Telegram bot token |
 | `STORAGE_PATH` | yes | — | SQLite file path |
-| `DECKBOX_SESSION_COOKIE` | yes | — | Deckbox session (expires; causes scraper auth failures) |
+| `DECKBOX_LOGIN` | yes* | — | Deckbox account login/email; bot logs in to obtain the session cookie |
+| `DECKBOX_PASSWORD` | yes* | — | Deckbox account password |
+| `DECKBOX_SESSION_COOKIE` | no | — | Optional manual `_tcg_session` override; used verbatim if set, skipping login |
 | `ENV` | yes | — | `local`/`dev` = DEBUG logs; `prod` = INFO |
+
+\* Auth requires **either** `DECKBOX_LOGIN`+`DECKBOX_PASSWORD` **or** `DECKBOX_SESSION_COOKIE`; `MustLoad` fatals if neither is present.
 | `FRESHNESS_TIME_LIMIT_HOURS` | no | 24 | Hours before SuggestDeckbox treats data as stale |
 | `CARD_LIST_REFRESH_HOURS` | no | 3 | Hours before auto-refresh triggers on search |
 | `CARD_LIST_BATCH_SIZE` | no | 1000 | Cards per INSERT batch |

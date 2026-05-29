@@ -1,10 +1,11 @@
 module FriendlyCardFinder
 
-go 1.26.1
+go 1.26.3
 
 require github.com/joho/godotenv v1.5.1
 
 require (
+	github.com/PuerkitoBio/goquery v1.11.0
 	github.com/go-telegram/bot v1.18.0
 	github.com/gocolly/colly v1.2.0
 	github.com/mattn/go-sqlite3 v1.14.34
@@ -13,7 +14,6 @@ require (
 )
 
 require (
-	github.com/PuerkitoBio/goquery v1.11.0 // indirect
 	github.com/andybalholm/cascadia v1.3.3 // indirect
 	github.com/antchfx/htmlquery v1.3.5 // indirect
 	github.com/antchfx/xmlquery v1.5.0 // indirect

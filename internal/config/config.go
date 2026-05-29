@@ -3,6 +3,7 @@ package config
 import (
 	"FriendlyCardFinder/env"
 	"log"
+	"path/filepath"
 	"strconv"
 )
 
@@ -11,6 +12,9 @@ type Config struct {
 	BotToken                string
 	Env                     string
 	DeckboxSessionCookie    string
+	DeckboxLogin            string
+	DeckboxPassword         string
+	DeckboxCookiePath       string
 	FreshnessTimeLimitHours int
 	CardListRefreshHours    int
 	CardListBatchSize       int
@@ -43,11 +47,24 @@ func MustLoad() *Config {
 		}
 	}
 
+	storagePath := env.StoragePath.GetValue()
+	deckboxLogin := env.DeckboxLogin.GetValue()
+	deckboxPassword := env.DeckboxPassword.GetValue()
+	deckboxSessionCookie := env.DeckboxSessionCookie.GetValue()
+
+	// Scraper auth requires either credentials to log in, or a manual cookie override.
+	if (deckboxLogin == "" || deckboxPassword == "") && deckboxSessionCookie == "" {
+		log.Fatal("deckbox auth not configured: set DECKBOX_LOGIN + DECKBOX_PASSWORD, or DECKBOX_SESSION_COOKIE")
+	}
+
 	return &Config{
-		StoragePath:             env.StoragePath.GetValue(),
+		StoragePath:             storagePath,
 		BotToken:                env.BotToken.GetValue(),
 		Env:                     env.Env.GetValue(),
-		DeckboxSessionCookie:    env.DeckboxSessionCookie.GetValue(),
+		DeckboxSessionCookie:    deckboxSessionCookie,
+		DeckboxLogin:            deckboxLogin,
+		DeckboxPassword:         deckboxPassword,
+		DeckboxCookiePath:       filepath.Join(filepath.Dir(storagePath), "deckbox_session"),
 		FreshnessTimeLimitHours: freshnessHours,
 		CardListRefreshHours:    cardListRefreshHours,
 		CardListBatchSize:       cardListBatchSize,

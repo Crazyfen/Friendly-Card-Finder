@@ -41,8 +41,8 @@ FriendlyCardFinder is a Telegram bot that helps Magic: The Gathering card collec
 **Configuration** (`internal/config/`, `env/`)
 
 - Loads from .env file via godotenv
-- Required vars: BOT_TOKEN, STORAGE_PATH, ENV (local/dev/prod), DECKBOX_SESSION_COOKIE
-- Optional vars: FRESHNESS_TIME_LIMIT_HOURS (default 24), CARD_LIST_REFRESH_HOURS (default 3), CARD_LIST_BATCH_SIZE (default 1000)
+- Required vars: BOT_TOKEN, STORAGE_PATH, ENV (local/dev/prod), and deckbox auth — either DECKBOX_LOGIN+DECKBOX_PASSWORD or DECKBOX_SESSION_COOKIE
+- Optional vars: DECKBOX_SESSION_COOKIE (manual `_tcg_session` override; used verbatim if set, skipping login), FRESHNESS_TIME_LIMIT_HOURS (default 24), CARD_LIST_REFRESH_HOURS (default 3), CARD_LIST_BATCH_SIZE (default 1000)
 - **CARD_LIST_BATCH_SIZE** controls the per-transaction batch size used by `SaveCardList()` (default 1000) — set via `env.CardListBatchSize`.
 - ENV controls logger level (debug for local/dev, info for prod)
 
@@ -138,7 +138,7 @@ func RefreshStaleUserLists(log, storage, scraper, refreshHours)
 
 **Build & Run**
 
-- The project uses `github.com/joho/godotenv` to load `.env` from the repo root. Ensure the following vars are set: `BOT_TOKEN`, `STORAGE_PATH`, `DECKBOX_SESSION_COOKIE`. Change `ENV` to `local`/`dev`/`prod` to control logger level.
+- The project uses `github.com/joho/godotenv` to load `.env` from the repo root. Ensure the following vars are set: `BOT_TOKEN`, `STORAGE_PATH`, and deckbox auth (`DECKBOX_LOGIN`+`DECKBOX_PASSWORD`, or `DECKBOX_SESSION_COOKIE`). Change `ENV` to `local`/`dev`/`prod` to control logger level.
 
 ```bash
 # build
@@ -161,7 +161,7 @@ go run -tags "fts5" main.go
 **Testing**
 
 - **Unit tests**: Mock `DeckboxSaver` for isolated logic tests (see `internal/deckbox/handler_test.go` for `fakeStorage` examples).
-- **Integration tests**: `scrapper_test.go` performs real HTTP calls against deckbox.org and expects a valid session cookie; set `DECKBOX_SESSION_COOKIE` in `.env` (or rely on the cookie embedded in the test). These tests require network access and stable responses.
+- **Integration tests**: `scrapper_test.go` performs real HTTP calls against deckbox.org and needs deckbox auth (`DECKBOX_LOGIN`+`DECKBOX_PASSWORD`, or a `DECKBOX_SESSION_COOKIE` override); they skip when neither is set. These tests require network access and stable responses. Offline scraper unit tests (`parseAuthenticityToken`, cookie file round-trip in `scrapper_internal_test.go`) always run.
 - **Storage tests** ([internal/storage/sqlite/sqlite_test.go](../internal/storage/sqlite/sqlite_test.go)) verify batching and transactional behavior:
   - `TestSaveCardListWithLargeCollection`: 20,000 cards verify batching works
   - `TestSaveCardListBatching`: Batch boundary tests (0, 1, 500, 1000, 1500, 3500, 15000 cards)
@@ -189,7 +189,7 @@ go test ./internal/storage/sqlite -run TestSaveCardListBatching -v
 go test -race ./...
 ```
 
-Note: when iterating on `scrapper.go` or `scrapper_test.go` use a real `DECKBOX_SESSION_COOKIE` and expect network flakiness — add retries when reproducing failures locally.
+Note: when iterating on `scrapper.go` or `scrapper_test.go` set deckbox auth (`DECKBOX_LOGIN`+`DECKBOX_PASSWORD`, or a `DECKBOX_SESSION_COOKIE` override) and expect network flakiness — add retries when reproducing failures locally.
 
 **Debugging**
 

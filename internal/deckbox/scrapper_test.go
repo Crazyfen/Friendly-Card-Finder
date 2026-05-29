@@ -12,11 +12,16 @@ import (
 
 func scraperFromEnv(t *testing.T) *deckbox.Scraper {
 	t.Helper()
-	cookie := env.DeckboxSessionCookie.GetValue()
-	if cookie == "" {
-		t.Skip("DECKBOX_SESSION_COOKIE not set; skipping integration test")
+	auth := deckbox.ScraperAuth{
+		Login:          env.DeckboxLogin.GetValue(),
+		Password:       env.DeckboxPassword.GetValue(),
+		CookieOverride: env.DeckboxSessionCookie.GetValue(),
+		CookiePath:     t.TempDir() + "/deckbox_session",
 	}
-	return deckbox.NewScraper(slog.New(slog.NewJSONHandler(os.Stdout, nil)), cookie)
+	if auth.CookieOverride == "" && (auth.Login == "" || auth.Password == "") {
+		t.Skip("no deckbox auth configured (set DECKBOX_SESSION_COOKIE or DECKBOX_LOGIN+DECKBOX_PASSWORD); skipping integration test")
+	}
+	return deckbox.NewScraper(slog.New(slog.NewJSONHandler(os.Stdout, nil)), auth)
 }
 
 func TestUserScrapper(t *testing.T) {
