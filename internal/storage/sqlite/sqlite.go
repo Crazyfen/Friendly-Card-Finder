@@ -41,40 +41,36 @@ type DB struct {
 	readDB  *sql.DB
 }
 
+// buildDSN appends the per-connection PRAGMAs as DSN query parameters so every
+// connection in a pool inherits them. Setting these via a single PRAGMA Exec on
+// a multi-connection pool would only configure whichever one connection ran it.
+//   - journal_mode=WAL is persisted in the DB header, but harmless to set per conn.
+//   - synchronous=NORMAL and busy_timeout are per-connection.
+//   - cache_size=-8000 gives each connection an 8 MB page cache.
+func buildDSN(dataSourceName string) string {
+	sep := "?"
+	if strings.Contains(dataSourceName, "?") {
+		sep = "&"
+	}
+	return dataSourceName + sep + "_journal_mode=WAL&_synchronous=NORMAL&_busy_timeout=5000&_cache_size=-8000"
+}
+
 func New(dataSourceName string, log *slog.Logger) (*SQLiteStorage, error) {
 	const op = "storage.sqlite.New"
 
-	writeDB, err := sql.Open("sqlite3", dataSourceName)
+	dsn := buildDSN(dataSourceName)
+
+	writeDB, err := sql.Open("sqlite3", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("%s: %w", op, err)
 	}
 	writeDB.SetMaxOpenConns(1)
 
-	readDB, err := sql.Open("sqlite3", dataSourceName)
+	readDB, err := sql.Open("sqlite3", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("%s: %w", op, err)
 	}
 	readDB.SetMaxOpenConns(max(4, runtime.NumCPU()))
-
-	if _, err := writeDB.Exec("PRAGMA journal_mode = WAL;"); err != nil {
-		return nil, fmt.Errorf("%s: set WAL: %w", op, err)
-	}
-	if _, err := writeDB.Exec("PRAGMA synchronous = NORMAL;"); err != nil {
-		return nil, fmt.Errorf("%s: set synchronous: %w", op, err)
-	}
-	if _, err := writeDB.Exec("PRAGMA busy_timeout = 5000;"); err != nil {
-		return nil, fmt.Errorf("%s: set busy_timeout: %w", op, err)
-	}
-
-	if _, err := readDB.Exec("PRAGMA journal_mode = WAL;"); err != nil {
-		return nil, fmt.Errorf("%s: set WAL: %w", op, err)
-	}
-	if _, err := readDB.Exec("PRAGMA synchronous = NORMAL;"); err != nil {
-		return nil, fmt.Errorf("%s: set synchronous: %w", op, err)
-	}
-	if _, err := readDB.Exec("PRAGMA busy_timeout = 5000;"); err != nil {
-		return nil, fmt.Errorf("%s: set busy_timeout: %w", op, err)
-	}
 
 	db := &DB{
 		writeDB: writeDB,
@@ -256,11 +252,6 @@ func (s *SQLiteStorage) SaveCardList(ctx context.Context, list deckbox.CardList)
 	const op = "storage.sqlite.SaveCardList"
 	log := s.log
 
-	err := s.ClearCardList(ctx, list.ListId)
-	if err != nil {
-		return fmt.Errorf("%s: %w", op, err)
-	}
-
 	// Convert map to slice for consistent batching
 	cards := make([]struct {
 		name     string
@@ -274,16 +265,32 @@ func (s *SQLiteStorage) SaveCardList(ctx context.Context, list deckbox.CardList)
 	}
 
 	totalCards := len(cards)
-	if totalCards == 0 {
-		return nil
-	}
 
-	// Begin transaction
+	// Begin transaction. The old rows are cleared and the new rows inserted in a
+	// single transaction so the replace is atomic (no window where the list reads
+	// empty) and costs one commit/fsync instead of three separate writes.
 	tx, err := s.db.writeDB.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("%s: %w", op, err)
 	}
 	defer tx.Rollback()
+
+	if _, err := tx.ExecContext(ctx, `DELETE FROM card_lists WHERE listId = ?`, list.ListId); err != nil {
+		return fmt.Errorf("%s: clear card_lists: %w", op, err)
+	}
+	if s.ftsEnabled {
+		if _, err := tx.ExecContext(ctx, `DELETE FROM card_lists_fts WHERE listId = ?`, list.ListId); err != nil {
+			return fmt.Errorf("%s: clear card_lists_fts: %w", op, err)
+		}
+	}
+
+	// An empty new list still needs the clear above committed.
+	if totalCards == 0 {
+		if err := tx.Commit(); err != nil {
+			return fmt.Errorf("%s: %w", op, err)
+		}
+		return nil
+	}
 
 	// Batch insert in chunks using configured batch size
 	batchSize := s.batchSize

@@ -143,11 +143,14 @@ func (s *Scraper) fetchCardListOnce(ctx context.Context, listId int64, cookie st
 		// follows redirects, so the final URL lands on /accounts/login.
 		if strings.HasSuffix(r.Request.URL.Path, "/accounts/login") {
 			authFailed = true
+			return
 		}
-	})
 
-	c.OnHTML("body", func(e *colly.HTMLElement) {
-		body, _ := e.DOM.Html()
+		// The export is plain text ("<qty> <name>" joined by <br/>), so parse the
+		// raw response body directly. Registering no OnHTML handlers means colly
+		// never builds a goquery DOM, avoiding a full HTML parse plus the re-
+		// serialization that e.DOM.Html() used to cost on every card list.
+		body := bodyInnerHTML(string(r.Body))
 		// Belt-and-suspenders: detect the login form in the body too.
 		if strings.Contains(body, "name='authenticity_token'") || strings.Contains(body, `name="authenticity_token"`) {
 			authFailed = true
@@ -337,6 +340,28 @@ func writeCookieFile(path, cookie string) error {
 		return nil
 	}
 	return os.WriteFile(path, []byte(cookie), 0o600)
+}
+
+// bodyInnerHTML returns the markup between the opening <body ...> tag and the
+// closing </body>, matching what colly's goquery OnHTML("body") handler used to
+// hand us — but with cheap string slicing instead of building and re-serializing
+// a full DOM. Deckbox (Rails) emits lowercase tags; if no <body> is present the
+// input is returned unchanged so parsing still has something to work with.
+func bodyInnerHTML(s string) string {
+	open := strings.Index(s, "<body")
+	if open == -1 {
+		return s
+	}
+	contentStart := open + len("<body")
+	// Skip to the end of the opening tag, past any attributes.
+	if gt := strings.IndexByte(s[contentStart:], '>'); gt != -1 {
+		contentStart += gt + 1
+	}
+	closeIdx := strings.LastIndex(s, "</body>")
+	if closeIdx < contentStart {
+		return s[contentStart:]
+	}
+	return s[contentStart:closeIdx]
 }
 
 // parseCardListExport parses the raw HTML body of a Deckbox set export page into
