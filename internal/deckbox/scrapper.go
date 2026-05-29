@@ -100,27 +100,8 @@ func (s *Scraper) FetchCardList(ctx context.Context, listId int64) (CardList, er
 
 	c.OnHTML("body", func(e *colly.HTMLElement) {
 		body, _ := e.DOM.Html()
-		body = strings.ReplaceAll(body, "\n", "")
-		elements := strings.SplitSeq(body, "<br/>")
-		for element := range elements {
-			element = strings.TrimSpace(element)
-			if element == "" {
-				continue
-			}
-			element = html.UnescapeString(element)
-			parts := strings.SplitN(element, " ", 2)
-			if len(parts) != 2 {
-				log.Error("failed to parse element", slog.String("element", element))
-				continue
-			} else {
-				quantity, err := strconv.Atoi(parts[0])
-				if err != nil {
-					log.Error("failed to parse quantity", slog.String("element", parts[0]), slog.String("error", err.Error()))
-					continue
-				}
-				cardName := parts[1]
-				cardList.AddCard(cardName, int16(quantity))
-			}
+		for cardName, quantity := range parseCardListExport(body, log) {
+			cardList.AddCard(cardName, quantity)
 		}
 	})
 
@@ -152,6 +133,34 @@ func (s *Scraper) FetchCardList(ctx context.Context, listId int64) (CardList, er
 	}
 
 	return cardList, nil
+}
+
+// parseCardListExport parses the raw HTML body of a Deckbox set export page into
+// a map of card name -> quantity. The export format is "<qty> <card name>"
+// entries separated by <br/> tags. Quantities for duplicate names are summed;
+// malformed entries are logged and skipped.
+func parseCardListExport(body string, log *slog.Logger) map[string]int16 {
+	cards := make(map[string]int16)
+	body = strings.ReplaceAll(body, "\n", "")
+	for element := range strings.SplitSeq(body, "<br/>") {
+		element = strings.TrimSpace(element)
+		if element == "" {
+			continue
+		}
+		element = html.UnescapeString(element)
+		parts := strings.SplitN(element, " ", 2)
+		if len(parts) != 2 {
+			log.Error("failed to parse element", slog.String("element", element))
+			continue
+		}
+		quantity, err := strconv.Atoi(parts[0])
+		if err != nil {
+			log.Error("failed to parse quantity", slog.String("element", element), slog.String("error", err.Error()))
+			continue
+		}
+		cards[parts[1]] += int16(quantity)
+	}
+	return cards
 }
 
 func extractIDFromElement(e *colly.HTMLElement) (*int64, error) {

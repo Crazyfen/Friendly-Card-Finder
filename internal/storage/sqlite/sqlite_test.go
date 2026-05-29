@@ -797,3 +797,73 @@ func BenchmarkSearchCard_FTSDisabled(b *testing.B) {
 func BenchmarkSearchCard_FTSEnabled(b *testing.B) {
 	benchmarkSearchCard(b, true)
 }
+
+// BenchmarkSaveCardList_BatchSizes sweeps the configured batch size at a fixed
+// collection size to surface how CARD_LIST_BATCH_SIZE affects write throughput
+// (fewer/larger statements vs. more/smaller ones).
+func BenchmarkSaveCardList_BatchSizes(b *testing.B) {
+	oldLogger := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(io.Discard, nil)))
+	defer slog.SetDefault(oldLogger)
+
+	const cardCount = 10000
+	ctx := context.Background()
+
+	for _, batchSize := range []int{100, 500, 1000, 5000} {
+		b.Run(fmt.Sprintf("batch=%d", batchSize), func(b *testing.B) {
+			storage, err := New(b.TempDir()+"/bench.db", slog.New(slog.NewTextHandler(io.Discard, nil)))
+			if err != nil {
+				b.Fatalf("failed to create storage: %v", err)
+			}
+			defer storage.Close()
+			storage.batchSize = batchSize
+
+			tradelistID := int64(12345)
+			if err := storage.SaveDeckboxUser(ctx, deckbox.DeckboxUser{
+				DeckboxLogin: "benchuser",
+				TradelistID:  &tradelistID,
+			}); err != nil {
+				b.Fatalf("failed to save deckbox user: %v", err)
+			}
+
+			cardList := deckbox.CardList{ListId: tradelistID, Cards: make(map[string]int16, cardCount)}
+			for i := 0; i < cardCount; i++ {
+				cardList.Cards[fmt.Sprintf("Card_%d", i)] = 1
+			}
+
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				if err := storage.SaveCardList(ctx, cardList); err != nil {
+					b.Fatalf("failed to save card list: %v", err)
+				}
+			}
+		})
+	}
+}
+
+// BenchmarkNormalizeASCII covers the per-card normalization that runs for every
+// FTS row on save and for every query token on search.
+func BenchmarkNormalizeASCII(b *testing.B) {
+	inputs := map[string]string{
+		"ascii":    "Lightning Bolt",
+		"accented": "Sméagol, Helpful Guide",
+	}
+	for name, in := range inputs {
+		b.Run(name, func(b *testing.B) {
+			b.ReportAllocs()
+			for i := 0; i < b.N; i++ {
+				_ = normalizeASCII(in)
+			}
+		})
+	}
+}
+
+// BenchmarkBuildFtsQueryTerm covers the query-string -> FTS MATCH conversion that
+// runs once per search.
+func BenchmarkBuildFtsQueryTerm(b *testing.B) {
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		_ = buildFtsQueryTerm("Vitu-Ghazi Inspector")
+	}
+}
