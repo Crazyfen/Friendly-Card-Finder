@@ -12,9 +12,13 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"runtime"
 	"strconv"
 	"strings"
 	"time"
+
+	"net/http"
+	_ "net/http/pprof" // registers /debug/pprof handlers on DefaultServeMux
 
 	"github.com/go-telegram/bot"
 	"github.com/go-telegram/bot/models"
@@ -41,6 +45,20 @@ func main() {
 
 	log := setupLogger(cfg.Env)
 	log = log.With(slog.String("env", cfg.Env))
+
+	if cfg.Env == envLocal || cfg.Env == envDev {
+		// Enable block/mutex sampling so those profiles return data
+		// (off by default). Hot enough only matters under load.
+		runtime.SetBlockProfileRate(1)
+		runtime.SetMutexProfileFraction(1)
+		go func() {
+			log.Info("pprof listening on localhost:6060")
+			// localhost-only so it's never exposed on the VPS
+			if err := http.ListenAndServe("localhost:6060", nil); err != nil {
+				log.Error("pprof server failed", sl.Err(err))
+			}
+		}()
+	}
 
 	storage, err := sqlite.New(cfg.StoragePath, log)
 	if err != nil {
