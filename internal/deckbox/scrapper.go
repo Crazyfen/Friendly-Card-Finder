@@ -345,24 +345,26 @@ func writeCookieFile(path, cookie string) error {
 // malformed entries are logged and skipped.
 func parseCardListExport(body string, log *slog.Logger) map[string]int16 {
 	cards := make(map[string]int16)
-	body = strings.ReplaceAll(body, "\n", "")
+	// TrimSpace on each element below also strips the stray newlines that the
+	// source formats into the export, so no whole-body copy is needed here.
 	for element := range strings.SplitSeq(body, "<br/>") {
 		element = strings.TrimSpace(element)
 		if element == "" {
 			continue
 		}
 		element = html.UnescapeString(element)
-		parts := strings.SplitN(element, " ", 2)
-		if len(parts) != 2 {
+		// Split on the first space without allocating a slice (SplitN would).
+		sp := strings.IndexByte(element, ' ')
+		if sp <= 0 {
 			log.Error("failed to parse element", slog.String("element", element))
 			continue
 		}
-		quantity, err := strconv.Atoi(parts[0])
+		quantity, err := strconv.Atoi(element[:sp])
 		if err != nil {
 			log.Error("failed to parse quantity", slog.String("element", element), slog.String("error", err.Error()))
 			continue
 		}
-		cards[parts[1]] += int16(quantity)
+		cards[element[sp+1:]] += int16(quantity)
 	}
 	return cards
 }

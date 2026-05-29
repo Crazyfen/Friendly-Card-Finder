@@ -12,8 +12,10 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 	"unicode"
+	"unicode/utf8"
 
 	"github.com/pressly/goose/v3"
 	"golang.org/x/text/transform"
@@ -616,20 +618,45 @@ func buildFtsQueryTerm(q string) string {
 	return strings.Join(tokens, " AND ")
 }
 
+// normalizerPool holds NFD→strip-combining-marks→NFC transformer chains. Building
+// the chain allocates ~8KB, so we reuse them across calls. x/text transformers are
+// not safe for concurrent use, and SaveCardList normalizes from worker pools, so
+// each goroutine borrows one from the pool. transform.String calls Reset itself.
+var normalizerPool = sync.Pool{New: func() any {
+	return transform.Chain(norm.NFD, transform.RemoveFunc(func(r rune) bool {
+		return unicode.Is(unicode.Mn, r)
+	}), norm.NFC)
+}}
+
 // normalizeASCII removes diacritic marks (accents) and lowercases the string.
 // It uses NFD normalization followed by removal of non-spacing marks, then recomposes.
 func normalizeASCII(s string) string {
 	if s == "" {
 		return ""
 	}
-	// Decompose, drop Mn marks, recompose
-	t := transform.Chain(norm.NFD, transform.RemoveFunc(func(r rune) bool {
-		return unicode.Is(unicode.Mn, r)
-	}), norm.NFC)
+	// Fast path: pure-ASCII strings have no combining marks, so the Unicode
+	// decomposition is a no-op — only lowercasing is needed. Card names are
+	// overwhelmingly ASCII, so this avoids the expensive transformer almost always.
+	if isASCII(s) {
+		return strings.ToLower(s)
+	}
+	// Accented path: decompose, drop Mn marks, recompose, then lowercase.
+	t := normalizerPool.Get().(transform.Transformer)
 	out, _, err := transform.String(t, s)
+	normalizerPool.Put(t)
 	if err != nil {
 		return strings.ToLower(s)
 	}
 	return strings.ToLower(out)
+}
+
+// isASCII reports whether s contains only ASCII bytes.
+func isASCII(s string) bool {
+	for i := 0; i < len(s); i++ {
+		if s[i] >= utf8.RuneSelf {
+			return false
+		}
+	}
+	return true
 }
 
