@@ -44,6 +44,69 @@ func newTestDB(t *testing.T) *SQLiteStorage {
 //
 // (Requires `benchstat`, e.g. `go install golang.org/x/perf/cmd/benchstat@latest`)
 
+// TestFtsSchemaUpgrade simulates a database created before quantity was stored
+// in the FTS table: the old 3-column card_lists_fts must be dropped, recreated
+// with the new schema, and repopulated from card_lists on startup.
+func TestFtsSchemaUpgrade(t *testing.T) {
+	ctx := context.Background()
+	dbFile := t.TempDir() + "/test.db"
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	s, err := New(dbFile, log)
+	if err != nil {
+		t.Fatalf("failed to create storage: %v", err)
+	}
+	if !s.ftsEnabled {
+		s.Close()
+		t.Skip("skipping: FTS5 not available in this build")
+	}
+
+	tradelistID := int64(777)
+	if err := s.SaveDeckboxUser(ctx, deckbox.DeckboxUser{DeckboxLogin: "upgradeuser", TradelistID: &tradelistID}); err != nil {
+		t.Fatalf("failed to save deckbox user: %v", err)
+	}
+	if err := s.SaveCardList(ctx, deckbox.CardList{
+		ListId: tradelistID,
+		Cards:  map[string]int16{"Lightning Bolt": 4, "Sméagol, Helpful Guide": 2},
+	}); err != nil {
+		t.Fatalf("failed to save card list: %v", err)
+	}
+
+	// Downgrade the FTS table to the old 3-column schema (without quantity).
+	if _, err := s.db.writeDB.Exec(`DROP TABLE card_lists_fts`); err != nil {
+		t.Fatalf("failed to drop fts table: %v", err)
+	}
+	if _, err := s.db.writeDB.Exec(`CREATE VIRTUAL TABLE card_lists_fts USING fts5(listId UNINDEXED, cardName, cardName_normalized);`); err != nil {
+		t.Fatalf("failed to create old-schema fts table: %v", err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatalf("failed to close storage: %v", err)
+	}
+
+	// Reopen: ensureFtsTable must detect the old schema and rebuild.
+	s2, err := New(dbFile, log)
+	if err != nil {
+		t.Fatalf("failed to reopen storage: %v", err)
+	}
+	defer s2.Close()
+	if !s2.ftsEnabled {
+		t.Fatal("expected FTS to be enabled after schema upgrade")
+	}
+
+	for name, wantQty := range map[string]int16{"Lightning Bolt": 4, "Smeagol": 2} {
+		results, err := s2.SearchCard(ctx, name, deckbox.ScopeTradelist)
+		if err != nil {
+			t.Fatalf("search %q failed: %v", name, err)
+		}
+		if len(results) != 1 {
+			t.Fatalf("search %q: got %d results, want 1", name, len(results))
+		}
+		if results[0].Quantity != wantQty {
+			t.Errorf("search %q: got quantity %d, want %d", name, results[0].Quantity, wantQty)
+		}
+	}
+}
+
 func TestSaveCardListWithLargeCollection(t *testing.T) {
 	// Create a temporary database for testing
 	dbFile := t.TempDir() + "/test.db"
@@ -796,6 +859,53 @@ func BenchmarkSearchCard_FTSDisabled(b *testing.B) {
 
 func BenchmarkSearchCard_FTSEnabled(b *testing.B) {
 	benchmarkSearchCard(b, true)
+}
+
+// BenchmarkSaveCardList_PopulatedDB replaces a single list while many other
+// lists already exist. This exercises the per-save DELETE against a large
+// card_lists / card_lists_fts table — the realistic refresh-cycle shape, where
+// a full-table scan in the FTS delete would dominate.
+func BenchmarkSaveCardList_PopulatedDB(b *testing.B) {
+	oldLogger := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(io.Discard, nil)))
+	defer slog.SetDefault(oldLogger)
+
+	storage, err := New(b.TempDir()+"/bench.db", slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err != nil {
+		b.Fatalf("failed to create storage: %v", err)
+	}
+	defer storage.Close()
+
+	ctx := context.Background()
+
+	// Background data: 40 other lists x 5,000 cards = 200,000 rows.
+	for l := int64(1); l <= 40; l++ {
+		cards := make(map[string]int16, 5000)
+		for i := 0; i < 5000; i++ {
+			cards[fmt.Sprintf("Card_%d_%d", l, i)] = 1
+		}
+		if err := storage.SaveCardList(ctx, deckbox.CardList{ListId: l, Cards: cards}); err != nil {
+			b.Fatalf("failed to seed list %d: %v", l, err)
+		}
+	}
+
+	// The list being refreshed.
+	tradelistID := int64(99999)
+	if err := storage.SaveDeckboxUser(ctx, deckbox.DeckboxUser{DeckboxLogin: "benchuser", TradelistID: &tradelistID}); err != nil {
+		b.Fatalf("failed to save deckbox user: %v", err)
+	}
+	cardList := deckbox.CardList{ListId: tradelistID, Cards: make(map[string]int16, 5000)}
+	for i := 0; i < 5000; i++ {
+		cardList.Cards[fmt.Sprintf("Card_%d", i)] = 1
+	}
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if err := storage.SaveCardList(ctx, cardList); err != nil {
+			b.Fatalf("failed to save card list: %v", err)
+		}
+	}
 }
 
 // BenchmarkSaveCardList_BatchSizes sweeps the configured batch size at a fixed

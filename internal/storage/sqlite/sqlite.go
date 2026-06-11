@@ -18,11 +18,28 @@ import (
 	"unicode/utf8"
 
 	"github.com/pressly/goose/v3"
+	"golang.org/x/text/runes"
 	"golang.org/x/text/transform"
 	"golang.org/x/text/unicode/norm"
 
-	_ "github.com/mattn/go-sqlite3"
+	sqlite3 "github.com/mattn/go-sqlite3"
 )
+
+// driverName is a sqlite3 driver variant whose connections get a 256 MB mmap
+// window. mmap'd reads come straight out of the OS page cache without a read()
+// syscall + copy per page, which speeds up searches once the DB outgrows the
+// 8 MB connection cache. There is no DSN parameter for mmap_size, hence the
+// ConnectHook.
+const driverName = "sqlite3_mmap"
+
+func init() {
+	sql.Register(driverName, &sqlite3.SQLiteDriver{
+		ConnectHook: func(conn *sqlite3.SQLiteConn) error {
+			_, err := conn.Exec("PRAGMA mmap_size=268435456", nil)
+			return err
+		},
+	})
+}
 
 //go:embed migrations/*.sql
 var embedMigrations embed.FS
@@ -32,6 +49,13 @@ type SQLiteStorage struct {
 	log        *slog.Logger
 	ftsEnabled bool
 	batchSize  int
+
+	// stmtCache holds lazily prepared read statements keyed by SQL text. The hot
+	// read queries (search, freshness checks) run on every user message, so we
+	// prepare them once instead of parse+prepare per call. *sql.Stmt is safe for
+	// concurrent use and re-prepares per pooled connection internally.
+	stmtMu    sync.RWMutex
+	stmtCache map[string]*sql.Stmt
 }
 
 const defaultCardBatchSize = 1000
@@ -60,13 +84,13 @@ func New(dataSourceName string, log *slog.Logger) (*SQLiteStorage, error) {
 
 	dsn := buildDSN(dataSourceName)
 
-	writeDB, err := sql.Open("sqlite3", dsn)
+	writeDB, err := sql.Open(driverName, dsn)
 	if err != nil {
 		return nil, fmt.Errorf("%s: %w", op, err)
 	}
 	writeDB.SetMaxOpenConns(1)
 
-	readDB, err := sql.Open("sqlite3", dsn)
+	readDB, err := sql.Open(driverName, dsn)
 	if err != nil {
 		return nil, fmt.Errorf("%s: %w", op, err)
 	}
@@ -88,7 +112,7 @@ func New(dataSourceName string, log *slog.Logger) (*SQLiteStorage, error) {
 
 	// FTS5 virtual table is handled separately because its availability depends
 	// on the SQLite build — we degrade gracefully if it is not supported.
-	ftsEnabled := createFtsTable(db.writeDB)
+	ftsEnabled := ensureFtsTable(db)
 
 	// Read batch size from environment variable if set
 	batchSize := defaultCardBatchSize
@@ -98,10 +122,60 @@ func New(dataSourceName string, log *slog.Logger) (*SQLiteStorage, error) {
 		}
 	}
 
-	return &SQLiteStorage{db: db, log: log, ftsEnabled: ftsEnabled, batchSize: batchSize}, nil
+	return &SQLiteStorage{
+		db:         db,
+		log:        log,
+		ftsEnabled: ftsEnabled,
+		batchSize:  batchSize,
+		stmtCache:  make(map[string]*sql.Stmt),
+	}, nil
+}
+
+// cachedStmt returns a cached prepared statement for query on the given pool,
+// preparing and caching it on first use. Read and write queries never share
+// SQL text, so one cache serves both pools.
+func (s *SQLiteStorage) cachedStmt(ctx context.Context, db *sql.DB, query string) (*sql.Stmt, error) {
+	s.stmtMu.RLock()
+	stmt, ok := s.stmtCache[query]
+	s.stmtMu.RUnlock()
+	if ok {
+		return stmt, nil
+	}
+
+	stmt, err := db.PrepareContext(ctx, query)
+	if err != nil {
+		return nil, err
+	}
+
+	s.stmtMu.Lock()
+	if existing, ok := s.stmtCache[query]; ok {
+		s.stmtMu.Unlock()
+		stmt.Close()
+		return existing, nil
+	}
+	s.stmtCache[query] = stmt
+	s.stmtMu.Unlock()
+	return stmt, nil
+}
+
+// readStmt returns a cached prepared statement for query on the read pool.
+func (s *SQLiteStorage) readStmt(ctx context.Context, query string) (*sql.Stmt, error) {
+	return s.cachedStmt(ctx, s.db.readDB, query)
+}
+
+// writeStmt returns a cached prepared statement for query on the write connection.
+func (s *SQLiteStorage) writeStmt(ctx context.Context, query string) (*sql.Stmt, error) {
+	return s.cachedStmt(ctx, s.db.writeDB, query)
 }
 
 func (s *SQLiteStorage) Close() error {
+	s.stmtMu.Lock()
+	for _, stmt := range s.stmtCache {
+		stmt.Close()
+	}
+	s.stmtCache = make(map[string]*sql.Stmt)
+	s.stmtMu.Unlock()
+
 	var firstErr error
 	if err := s.db.writeDB.Close(); err != nil {
 		firstErr = fmt.Errorf("writeDB close: %w", err)
@@ -118,14 +192,13 @@ func (s *SQLiteStorage) Close() error {
 func (s *SQLiteStorage) RegisterUser(ctx context.Context, user deckbox.BotUser) error {
 	const op = "storage.sqlite.RegisterUser"
 
-	stmt, err := s.db.writeDB.PrepareContext(ctx, `
+	stmt, err := s.writeStmt(ctx, `
 	INSERT INTO users(telegramId, username, deckboxLogin)
-	VALUES (?, ?, ?) 
+	VALUES (?, ?, ?)
 	`)
 	if err != nil {
 		return fmt.Errorf("%s preparing statement: %w", op, err)
 	}
-	defer stmt.Close()
 
 	_, err = stmt.Exec(user.TelegramID, user.TelegramUsername, user.DeckboxLogin)
 	if err != nil {
@@ -138,7 +211,7 @@ func (s *SQLiteStorage) RegisterUser(ctx context.Context, user deckbox.BotUser) 
 func (s *SQLiteStorage) SaveDeckboxUser(ctx context.Context, user deckbox.DeckboxUser) error {
 	const op = "storage.sqlite.SaveDeckboxUser"
 
-	stmt, err := s.db.writeDB.PrepareContext(ctx, `
+	stmt, err := s.writeStmt(ctx, `
 	INSERT INTO deckbox_users(deckboxLogin, inventoryId, tradelistId, wishlistId)
 	VALUES (?, ?, ?, ?)
 	ON CONFLICT(deckboxLogin) DO UPDATE SET
@@ -148,7 +221,6 @@ func (s *SQLiteStorage) SaveDeckboxUser(ctx context.Context, user deckbox.Deckbo
 	if err != nil {
 		return fmt.Errorf("%s: %w", op, err)
 	}
-	defer stmt.Close()
 
 	_, err = stmt.Exec(user.DeckboxLogin, user.InventoryID, user.TradelistID, user.WishlistID)
 	if err != nil {
@@ -161,7 +233,7 @@ func (s *SQLiteStorage) SaveDeckboxUser(ctx context.Context, user deckbox.Deckbo
 func (s *SQLiteStorage) UpdateDeckboxUserTimestamp(ctx context.Context, deckboxLogin string, updatedAt int64) error {
 	const op = "storage.sqlite.UpdateDeckboxUserTimestamp"
 
-	stmt, err := s.db.writeDB.PrepareContext(ctx, `
+	stmt, err := s.writeStmt(ctx, `
 	UPDATE deckbox_users
 	SET updated_at = ?
 	WHERE deckboxLogin = ?
@@ -169,7 +241,6 @@ func (s *SQLiteStorage) UpdateDeckboxUserTimestamp(ctx context.Context, deckboxL
 	if err != nil {
 		return fmt.Errorf("%s: %w", op, err)
 	}
-	defer stmt.Close()
 
 	_, err = stmt.Exec(updatedAt, deckboxLogin)
 	if err != nil {
@@ -182,7 +253,7 @@ func (s *SQLiteStorage) UpdateDeckboxUserTimestamp(ctx context.Context, deckboxL
 func (s *SQLiteStorage) GetDeckboxUser(ctx context.Context, deckboxLogin string) (*deckbox.DeckboxUser, error) {
 	const op = "storage.sqlite.GetDeckboxUser"
 
-	stmt, err := s.db.readDB.PrepareContext(ctx, `
+	stmt, err := s.readStmt(ctx, `
 	SELECT deckboxLogin, inventoryId, tradelistId, wishlistId, updated_at
 	FROM deckbox_users
 	WHERE deckboxLogin = ?
@@ -190,7 +261,6 @@ func (s *SQLiteStorage) GetDeckboxUser(ctx context.Context, deckboxLogin string)
 	if err != nil {
 		return nil, fmt.Errorf("%s: %w", op, err)
 	}
-	defer stmt.Close()
 
 	var inventoryId *int64
 	var tradelistId *int64
@@ -217,14 +287,13 @@ func (s *SQLiteStorage) GetDeckboxUser(ctx context.Context, deckboxLogin string)
 func (s *SQLiteStorage) GetAllDeckboxUsersWithOldLists(ctx context.Context, thresholdSeconds int64) ([]string, error) {
 	const op = "storage.sqlite.GetAllDeckboxUsersWithOldLists"
 
-	stmt, err := s.db.readDB.PrepareContext(ctx, `
+	stmt, err := s.readStmt(ctx, `
 	SELECT deckboxLogin FROM deckbox_users
 	WHERE updated_at IS NULL OR updated_at < ?
 	`)
 	if err != nil {
 		return nil, fmt.Errorf("%s: %w", op, err)
 	}
-	defer stmt.Close()
 
 	rows, err := stmt.Query(thresholdSeconds)
 	if err != nil {
@@ -252,19 +321,7 @@ func (s *SQLiteStorage) SaveCardList(ctx context.Context, list deckbox.CardList)
 	const op = "storage.sqlite.SaveCardList"
 	log := s.log
 
-	// Convert map to slice for consistent batching
-	cards := make([]struct {
-		name     string
-		quantity int16
-	}, 0, len(list.Cards))
-	for cardName, quantity := range list.Cards {
-		cards = append(cards, struct {
-			name     string
-			quantity int16
-		}{cardName, quantity})
-	}
-
-	totalCards := len(cards)
+	totalCards := len(list.Cards)
 
 	// Begin transaction. The old rows are cleared and the new rows inserted in a
 	// single transaction so the replace is atomic (no window where the list reads
@@ -279,7 +336,9 @@ func (s *SQLiteStorage) SaveCardList(ctx context.Context, list deckbox.CardList)
 		return fmt.Errorf("%s: clear card_lists: %w", op, err)
 	}
 	if s.ftsEnabled {
-		if _, err := tx.ExecContext(ctx, `DELETE FROM card_lists_fts WHERE listId = ?`, list.ListId); err != nil {
+		// MATCH on the indexed listId column finds the list's rows through the
+		// FTS index; a plain `WHERE listId = ?` would scan the entire table.
+		if _, err := tx.ExecContext(ctx, `DELETE FROM card_lists_fts WHERE card_lists_fts MATCH ?`, ftsListIdQuery(list.ListId)); err != nil {
 			return fmt.Errorf("%s: clear card_lists_fts: %w", op, err)
 		}
 	}
@@ -292,8 +351,10 @@ func (s *SQLiteStorage) SaveCardList(ctx context.Context, list deckbox.CardList)
 		return nil
 	}
 
-	// Batch insert in chunks using configured batch size
-	batchSize := s.batchSize
+	// Batch insert in chunks using configured batch size. The FTS insert binds
+	// 4 params per card, so clamp the batch to stay under SQLite's 32,766
+	// bound-parameter limit regardless of CARD_LIST_BATCH_SIZE.
+	batchSize := min(s.batchSize, 8000)
 	totalBatches := (totalCards + batchSize - 1) / batchSize
 
 	startTime := time.Now()
@@ -301,56 +362,49 @@ func (s *SQLiteStorage) SaveCardList(ctx context.Context, list deckbox.CardList)
 		log.Info("save card list finished", slog.String("operation", op), slog.Int64("list_id", list.ListId), slog.Duration("duration_ms", time.Since(startTime)))
 	}()
 
-	for batchNum := range totalBatches {
-		startIdx := batchNum * batchSize
-		endIdx := min(startIdx+batchSize, totalCards)
+	// All batches except the last have identical SQL, so prepare those
+	// statements once and reuse them across batches.
+	var fullStmt, fullFtsStmt *sql.Stmt
+	defer func() {
+		if fullStmt != nil {
+			fullStmt.Close()
+		}
+		if fullFtsStmt != nil {
+			fullFtsStmt.Close()
+		}
+	}()
 
-		batchCards := cards[startIdx:endIdx]
-		batchCardCount := len(batchCards)
+	valueArgs := make([]any, 0, min(totalCards, batchSize)*3)
+	ftsValueArgs := make([]any, 0, min(totalCards, batchSize)*4)
+	batchNum := 0
 
-		// Prepare inserts for card_lists
-		valueStrings := make([]string, 0, batchCardCount)
-		valueArgs := make([]any, 0, batchCardCount*3)
+	// flushBatch writes the accumulated args as one multi-row INSERT per table.
+	flushBatch := func(batchCardCount int) error {
+		isFullBatch := batchCardCount == batchSize
 
-		// Prepare inserts for card_lists_fts (if enabled)
-		ftsValueStrings := make([]string, 0, batchCardCount)
-		// store three fields per FTS row: listId, cardName, cardName_normalized
-		ftsValueArgs := make([]any, 0, batchCardCount*3)
-
-		for _, card := range batchCards {
-			valueStrings = append(valueStrings, "(?, ?, ?)")
-			valueArgs = append(valueArgs, list.ListId)
-			valueArgs = append(valueArgs, card.name)
-			valueArgs = append(valueArgs, card.quantity)
-
-			if s.ftsEnabled {
-				ftsValueStrings = append(ftsValueStrings, "(?, ?, ?)")
-				ftsValueArgs = append(ftsValueArgs, list.ListId)
-				ftsValueArgs = append(ftsValueArgs, card.name)
-				ftsValueArgs = append(ftsValueArgs, normalizeASCII(card.name))
+		stmt := fullStmt
+		if stmt == nil || !isFullBatch {
+			query := `INSERT INTO card_lists(listId, cardName, quantity) VALUES ` + placeholderRows(batchCardCount, 3)
+			var err error
+			stmt, err = tx.PrepareContext(ctx, query)
+			if err != nil {
+				log.Error(
+					"failed to prepare batch statement",
+					slog.String("operation", op),
+					slog.Int64("list_id", list.ListId),
+					slog.Int("batch_num", batchNum+1),
+					slog.Int("batch_card_count", batchCardCount),
+				)
+				return fmt.Errorf("%s: prepare batch %d: %w", op, batchNum+1, err)
 			}
+			if isFullBatch {
+				fullStmt = stmt
+			}
+			// One-off statements for the final partial batch are closed by the
+			// transaction itself on Commit/Rollback.
 		}
 
-		query := fmt.Sprintf(`
-		INSERT INTO card_lists(listId, cardName, quantity)
-		VALUES %s
-		`, strings.Join(valueStrings, ", "))
-
-		stmt, err := tx.PrepareContext(ctx, query)
-		if err != nil {
-			log.Error(
-				"failed to prepare batch statement",
-				slog.String("operation", op),
-				slog.Int64("list_id", list.ListId),
-				slog.Int("batch_num", batchNum+1),
-				slog.Int("batch_card_count", batchCardCount),
-			)
-			return fmt.Errorf("%s: prepare batch %d: %w", op, batchNum+1, err)
-		}
-
-		_, err = stmt.Exec(valueArgs...)
-		stmt.Close()
-		if err != nil {
+		if _, err := stmt.Exec(valueArgs...); err != nil {
 			log.Error(
 				"failed to execute batch statement",
 				slog.String("operation", op),
@@ -362,27 +416,28 @@ func (s *SQLiteStorage) SaveCardList(ctx context.Context, list deckbox.CardList)
 		}
 
 		// Insert into FTS table as well when enabled
-		if s.ftsEnabled && len(ftsValueStrings) > 0 {
-			ftsQuery := fmt.Sprintf(`
-			INSERT INTO card_lists_fts(listId, cardName, cardName_normalized)
-			VALUES %s
-			`, strings.Join(ftsValueStrings, ", "))
-
-			ftsStmt, err := tx.PrepareContext(ctx, ftsQuery)
-			if err != nil {
-				log.Error(
-					"failed to prepare fts batch statement",
-					slog.String("operation", op),
-					slog.Int64("list_id", list.ListId),
-					slog.Int("batch_num", batchNum+1),
-					slog.Int("batch_card_count", batchCardCount),
-				)
-				return fmt.Errorf("%s: prepare fts batch %d: %w", op, batchNum+1, err)
+		if s.ftsEnabled {
+			ftsStmt := fullFtsStmt
+			if ftsStmt == nil || !isFullBatch {
+				ftsQuery := `INSERT INTO card_lists_fts(listId, cardName, cardName_normalized, quantity) VALUES ` + placeholderRows(batchCardCount, 4)
+				var err error
+				ftsStmt, err = tx.PrepareContext(ctx, ftsQuery)
+				if err != nil {
+					log.Error(
+						"failed to prepare fts batch statement",
+						slog.String("operation", op),
+						slog.Int64("list_id", list.ListId),
+						slog.Int("batch_num", batchNum+1),
+						slog.Int("batch_card_count", batchCardCount),
+					)
+					return fmt.Errorf("%s: prepare fts batch %d: %w", op, batchNum+1, err)
+				}
+				if isFullBatch {
+					fullFtsStmt = ftsStmt
+				}
 			}
 
-			_, err = ftsStmt.Exec(ftsValueArgs...)
-			ftsStmt.Close()
-			if err != nil {
+			if _, err := ftsStmt.Exec(ftsValueArgs...); err != nil {
 				log.Error(
 					"failed to execute fts batch statement",
 					slog.String("operation", op),
@@ -394,7 +449,7 @@ func (s *SQLiteStorage) SaveCardList(ctx context.Context, list deckbox.CardList)
 			}
 		}
 
-		log.Info(
+		log.Debug(
 			"card list batch saved",
 			slog.String("operation", op),
 			slog.Int64("list_id", list.ListId),
@@ -402,6 +457,31 @@ func (s *SQLiteStorage) SaveCardList(ctx context.Context, list deckbox.CardList)
 			slog.Int("total_batches", totalBatches),
 			slog.Int("batch_card_count", batchCardCount),
 		)
+		batchNum++
+		valueArgs = valueArgs[:0]
+		ftsValueArgs = ftsValueArgs[:0]
+		return nil
+	}
+
+	// Stream the map directly into batches — no intermediate slice copy.
+	pending := 0
+	for cardName, quantity := range list.Cards {
+		valueArgs = append(valueArgs, list.ListId, cardName, quantity)
+		if s.ftsEnabled {
+			ftsValueArgs = append(ftsValueArgs, list.ListId, cardName, normalizeASCII(cardName), quantity)
+		}
+		pending++
+		if pending == batchSize {
+			if err := flushBatch(pending); err != nil {
+				return err
+			}
+			pending = 0
+		}
+	}
+	if pending > 0 {
+		if err := flushBatch(pending); err != nil {
+			return err
+		}
 	}
 
 	// Commit transaction
@@ -416,14 +496,13 @@ func (s *SQLiteStorage) SaveCardList(ctx context.Context, list deckbox.CardList)
 func (s *SQLiteStorage) ClearCardList(ctx context.Context, listId int64) error {
 	const op = "storage.sqlite.ClearCardList"
 
-	stmt, err := s.db.writeDB.PrepareContext(ctx, `
+	stmt, err := s.writeStmt(ctx, `
 	DELETE FROM card_lists
 	WHERE listId = ?
 	`)
 	if err != nil {
 		return fmt.Errorf("%s: %w", op, err)
 	}
-	defer stmt.Close()
 
 	_, err = stmt.Exec(listId)
 	if err != nil {
@@ -431,7 +510,9 @@ func (s *SQLiteStorage) ClearCardList(ctx context.Context, listId int64) error {
 	}
 
 	// Also clear FTS table entries if present (non-fatal if FTS table does not exist)
-	_, _ = s.db.writeDB.Exec(`DELETE FROM card_lists_fts WHERE listId = ?`, listId)
+	if s.ftsEnabled {
+		_, _ = s.db.writeDB.Exec(`DELETE FROM card_lists_fts WHERE card_lists_fts MATCH ?`, ftsListIdQuery(listId))
+	}
 
 	return nil
 }
@@ -456,23 +537,22 @@ func (s *SQLiteStorage) SearchCard(ctx context.Context, cardName string, scope s
 	if s.ftsEnabled {
 		matchQuery := buildFtsQueryTerm(cardName)
 		if matchQuery != "" {
-			// Match against normalized column to support accent-insensitive matching
+			// Match against normalized column to support accent-insensitive matching.
+			// quantity is stored in the FTS table, so no join back to card_lists.
 			sqlStmt := fmt.Sprintf(`
-			SELECT cl.listId, cl.cardName COLLATE NOCASE, cl.quantity,
+			SELECT fts.listId, fts.cardName, fts.quantity,
 			       du.deckboxLogin, u.telegramId, u.username
-			FROM card_lists AS cl
-			JOIN card_lists_fts AS fts ON cl.listId = fts.listId AND cl.cardName = fts.cardName
-			JOIN deckbox_users AS du ON cl.listId = du.%s
+			FROM card_lists_fts AS fts
+			JOIN deckbox_users AS du ON fts.listId = du.%s
 			LEFT JOIN users AS u ON du.deckboxLogin = u.deckboxLogin
-			WHERE fts.cardName_normalized MATCH ?
-			ORDER BY cl.listId ASC, cl.cardName ASC
+			WHERE fts.card_lists_fts MATCH ?
+			ORDER BY fts.listId ASC
 			`, column)
 
-			stmt, err := s.db.readDB.PrepareContext(ctx, sqlStmt)
+			stmt, err := s.readStmt(ctx, sqlStmt)
 			if err != nil {
 				return nil, fmt.Errorf("%s: %w", op, err)
 			}
-			defer stmt.Close()
 
 			rows, err = stmt.QueryContext(ctx, matchQuery)
 			if err != nil {
@@ -490,14 +570,13 @@ func (s *SQLiteStorage) SearchCard(ctx context.Context, cardName string, scope s
 		JOIN deckbox_users AS du ON cl.listId = du.%s
 		LEFT JOIN users AS u ON du.deckboxLogin = u.deckboxLogin
 		WHERE cl.cardName LIKE ?
-		ORDER BY cl.listId ASC, cl.cardName ASC
+		ORDER BY cl.listId ASC
 		`, column)
 
-		stmt, err := s.db.readDB.PrepareContext(ctx, sqlStmt)
+		stmt, err := s.readStmt(ctx, sqlStmt)
 		if err != nil {
 			return nil, fmt.Errorf("%s: %w", op, err)
 		}
-		defer stmt.Close()
 
 		rows, err = stmt.QueryContext(ctx, "%"+cardName+"%")
 		if err != nil {
@@ -539,7 +618,7 @@ func (s *SQLiteStorage) SearchCard(ctx context.Context, cardName string, scope s
 func (s *SQLiteStorage) GetOwnerByListId(ctx context.Context, listId int64) (*deckbox.CardListOwnerInfo, error) {
 	const op = "storage.sqlite.GetOwnerByListId"
 
-	stmt, err := s.db.readDB.PrepareContext(ctx, `
+	stmt, err := s.readStmt(ctx, `
 	SELECT du.deckboxLogin, u.telegramId, u.username
 	FROM deckbox_users AS du
 	LEFT JOIN users AS u ON du.deckboxLogin = u.deckboxLogin
@@ -549,7 +628,6 @@ func (s *SQLiteStorage) GetOwnerByListId(ctx context.Context, listId int64) (*de
 	if err != nil {
 		return nil, fmt.Errorf("%s: %w", op, err)
 	}
-	defer stmt.Close()
 
 	var deckboxLogin string
 	var telegramId *int64
@@ -570,23 +648,129 @@ func (s *SQLiteStorage) GetOwnerByListId(ctx context.Context, listId int64) (*de
 	}, nil
 }
 
-// createFtsTable attempts to create an FTS5 virtual table for fast searching.
-// Returns true if the table was successfully created or already exists, false otherwise.
-func createFtsTable(db *sql.DB) bool {
+// ftsColumnSpec is the current column layout of the search table, also used to
+// recognize an up-to-date table in sqlite_master.
+//   - listId is INDEXED so DELETE ... MATCH 'listId:<id>' uses the FTS index
+//     instead of scanning the whole table on every list replace.
+//   - cardName is display-only (searches always go through cardName_normalized),
+//     so it is UNINDEXED to keep the index small and writes fast.
+//   - quantity is stored (UNINDEXED) so a search reads everything from the FTS
+//     table directly instead of joining every matched row back to card_lists.
+const ftsColumnSpec = `(listId, cardName UNINDEXED, cardName_normalized, quantity UNINDEXED)`
+
+const ftsCreateSQL = `CREATE VIRTUAL TABLE IF NOT EXISTS card_lists_fts USING fts5` + ftsColumnSpec + `;`
+
+// ensureFtsTable attempts to create the FTS5 virtual table for fast searching.
+// Returns true if the table exists with the current schema, false otherwise.
+// A pre-existing table with an outdated column layout is dropped, recreated,
+// and repopulated from card_lists.
+func ensureFtsTable(db *DB) bool {
 	// FTS5 may not be enabled in all SQLite builds. Don't treat failures as fatal.
 	// We add a normalized column `cardName_normalized` that stores a lowercase,
 	// diacritics-stripped version of the card name to support accent-insensitive searches.
-	_, err := db.Exec(`CREATE VIRTUAL TABLE IF NOT EXISTS card_lists_fts USING fts5(listId UNINDEXED, cardName, cardName_normalized);`)
-	if err != nil {
+	var schema string
+	err := db.writeDB.QueryRow(`SELECT sql FROM sqlite_master WHERE type='table' AND name='card_lists_fts'`).Scan(&schema)
+	switch {
+	case err == sql.ErrNoRows:
+		// Fresh database: create below.
+	case err != nil:
 		// log to standard logger; we don't want to depend on slog here during init
+		fmt.Printf("warning: could not inspect FTS5 schema: %v\n", err)
+		return false
+	case strings.Contains(schema, ftsColumnSpec):
+		return true
+	default:
+		// Outdated column layout: rebuild from card_lists.
+		if _, err := db.writeDB.Exec(`DROP TABLE card_lists_fts`); err != nil {
+			fmt.Printf("warning: could not drop outdated FTS5 table: %v\n", err)
+			return false
+		}
+	}
+
+	if _, err := db.writeDB.Exec(ftsCreateSQL); err != nil {
 		fmt.Printf("warning: FTS5 virtual table not created: %v\n", err)
+		return false
+	}
+	if err := repopulateFts(db); err != nil {
+		fmt.Printf("warning: FTS5 table rebuild failed: %v\n", err)
 		return false
 	}
 	return true
 }
 
-// buildFtsQueryTerm converts a user search string into an FTS5 MATCH query supporting
-// prefix matching for each term (e.g., "light" -> "light*").
+// repopulateFts fills an empty card_lists_fts from card_lists. Normalization
+// must run in Go (SQLite lower() is ASCII-only and cannot strip diacritics), so
+// rows are read through the read pool and inserted in batches.
+func repopulateFts(db *DB) error {
+	rows, err := db.readDB.Query(`SELECT listId, cardName, quantity FROM card_lists`)
+	if err != nil {
+		return err
+	}
+
+	type ftsRow struct {
+		listId   int64
+		cardName string
+		quantity int64
+	}
+	var all []ftsRow
+	for rows.Next() {
+		var r ftsRow
+		if err := rows.Scan(&r.listId, &r.cardName, &r.quantity); err != nil {
+			rows.Close()
+			return err
+		}
+		all = append(all, r)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return err
+	}
+	rows.Close()
+
+	if len(all) == 0 {
+		return nil
+	}
+
+	tx, err := db.writeDB.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	const batch = 1000
+	args := make([]any, 0, batch*4)
+	for start := 0; start < len(all); start += batch {
+		end := min(start+batch, len(all))
+		args = args[:0]
+		for _, r := range all[start:end] {
+			args = append(args, r.listId, r.cardName, normalizeASCII(r.cardName), r.quantity)
+		}
+		query := `INSERT INTO card_lists_fts(listId, cardName, cardName_normalized, quantity) VALUES ` + placeholderRows(end-start, 4)
+		if _, err := tx.Exec(query, args...); err != nil {
+			return err
+		}
+	}
+
+	return tx.Commit()
+}
+
+// placeholderRows returns n comma-separated placeholder tuples of cols columns,
+// e.g. placeholderRows(2, 3) == "(?, ?, ?), (?, ?, ?)".
+func placeholderRows(n, cols int) string {
+	row := "(?" + strings.Repeat(", ?", cols-1) + ")"
+	return row + strings.Repeat(", "+row, n-1)
+}
+
+// ftsListIdQuery returns the FTS5 MATCH expression selecting all rows of a list
+// via the indexed listId column, e.g. "listId:12345".
+func ftsListIdQuery(listId int64) string {
+	return "listId:" + strconv.FormatInt(listId, 10)
+}
+
+// buildFtsQueryTerm converts a user search string into an FTS5 MATCH query
+// supporting prefix matching for each term (e.g., "light" ->
+// "cardName_normalized:light*"). Every term carries an explicit column filter
+// so numeric card-name searches can never match the indexed listId column.
 func buildFtsQueryTerm(q string) string {
 	q = strings.TrimSpace(q)
 	if q == "" {
@@ -612,7 +796,7 @@ func buildFtsQueryTerm(q string) string {
 			if sp != "" {
 				norm := normalizeASCII(sp)
 				if norm != "" {
-					tokens = append(tokens, norm+"*")
+					tokens = append(tokens, "cardName_normalized:"+norm+"*")
 				}
 			}
 		}
@@ -630,9 +814,7 @@ func buildFtsQueryTerm(q string) string {
 // not safe for concurrent use, and SaveCardList normalizes from worker pools, so
 // each goroutine borrows one from the pool. transform.String calls Reset itself.
 var normalizerPool = sync.Pool{New: func() any {
-	return transform.Chain(norm.NFD, transform.RemoveFunc(func(r rune) bool {
-		return unicode.Is(unicode.Mn, r)
-	}), norm.NFC)
+	return transform.Chain(norm.NFD, runes.Remove(runes.In(unicode.Mn)), norm.NFC)
 }}
 
 // normalizeASCII removes diacritic marks (accents) and lowercases the string.
@@ -666,4 +848,3 @@ func isASCII(s string) bool {
 	}
 	return true
 }
-

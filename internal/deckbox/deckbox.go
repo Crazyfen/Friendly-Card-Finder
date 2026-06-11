@@ -34,6 +34,9 @@ type DeckboxUser struct {
 type CardList struct {
 	ListId int64
 	Cards  map[string]int16
+	// BodyHash is the FNV-64a hash of the raw export body this list was parsed
+	// from (0 when unknown). It lets refresh skip rewriting unchanged lists.
+	BodyHash uint64
 }
 
 type CardListOwnerInfo struct {
@@ -113,7 +116,8 @@ type Scraper struct {
 	password       string
 	cookieOverride string
 	cookiePath     string
-	httpClient     *http.Client
+	httpClient     *http.Client // login client: cookie jar, no redirect following
+	fetchClient    *http.Client // scrape client: follows redirects, no jar
 
 	mu            sync.Mutex // guards sessionCookie and serializes logins (single-flight)
 	sessionCookie string
@@ -127,17 +131,34 @@ func NewScraper(log *slog.Logger, auth ScraperAuth) *Scraper {
 	// is sent with the login POST. CheckRedirect stops on the success redirect so
 	// we can detect it (302) versus a failed login (200 re-rendering the form).
 	jar, _ := cookiejar.New(nil)
+
+	// One shared transport keeps TLS connections to deckbox.org alive across all
+	// profile/export fetches; the worker pools issue 4 requests per user, so
+	// without keep-alive every request would pay a fresh TCP+TLS handshake.
+	transport := &http.Transport{
+		Proxy:               http.ProxyFromEnvironment,
+		ForceAttemptHTTP2:   true,
+		MaxIdleConns:        32,
+		MaxIdleConnsPerHost: 16,
+		IdleConnTimeout:     90 * time.Second,
+	}
+
 	return &Scraper{
 		login:          auth.Login,
 		password:       auth.Password,
 		cookieOverride: auth.CookieOverride,
 		cookiePath:     auth.CookiePath,
 		httpClient: &http.Client{
-			Jar:     jar,
-			Timeout: 30 * time.Second,
+			Transport: transport,
+			Jar:       jar,
+			Timeout:   30 * time.Second,
 			CheckRedirect: func(*http.Request, []*http.Request) error {
 				return http.ErrUseLastResponse
 			},
+		},
+		fetchClient: &http.Client{
+			Transport: transport,
+			Timeout:   60 * time.Second,
 		},
 		log: log,
 	}
@@ -156,10 +177,11 @@ func (scr *SearchCardResult) FormatForTelegram(lang string, scope string) string
 	}
 
 	var response strings.Builder
-	response.WriteString(fmt.Sprintf(i18n.T(lang, resultsHeaderKey), scr.SearchQuery))
+	fmt.Fprintf(&response, i18n.T(lang, resultsHeaderKey), scr.SearchQuery)
 
+	// The encoded query is the same for every result; encode once.
+	uEnc := b64.URLEncoding.EncodeToString([]byte(scr.SearchQuery))
 	for _, cl := range scr.SearchResults {
-		uEnc := b64.URLEncoding.EncodeToString([]byte(scr.SearchQuery))
 		linkURL := fmt.Sprintf("https://deckbox.org/sets/%d?f=17%v", cl.ListId, uEnc)
 		response.WriteString(fmt.Sprintf(i18n.T(lang, "search.deckbox_link"), linkURL, cl.DeckboxLogin))
 

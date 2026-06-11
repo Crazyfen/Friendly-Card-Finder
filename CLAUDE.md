@@ -2,14 +2,6 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-## graphify
-
-This project has a graphify knowledge graph at `graphify-out/`.
-
-- Before answering architecture/codebase questions, read [graphify-out/GRAPH_REPORT.md](graphify-out/GRAPH_REPORT.md) for god nodes and community structure
-- If [graphify-out/wiki/index.md](graphify-out/wiki/index.md) exists, navigate it instead of reading raw files
-- After modifying code files, run `python3 -c "from graphify.watch import _rebuild_code; from pathlib import Path; _rebuild_code(Path('.'))"` to keep the graph current
-
 ## Overview
 
 Telegram bot for searching Magic: The Gathering cards across Deckbox.org user collections. Scrapes Deckbox profiles, stores inventory/tradelist/wishlist in SQLite, responds to search queries.
@@ -38,7 +30,7 @@ internal/
   config/config.go           .env loading (MustLoad panics on missing required vars)
   deckbox/
     deckbox.go               Domain types + DeckboxSaver interface
-    scrapper.go              Colly-based HTML scraper + Deckbox login/cookie auth
+    scrapper.go              net/http + goquery scraper (shared keep-alive client) + Deckbox login/cookie auth
     handler.go               NewUser, SearchCard, RefreshStaleUserLists, SuggestDeckbox
   storage/sqlite/sqlite.go   SQLite implementation of DeckboxSaver
   i18n/i18n.go               RU/EN translations via T(lang, key)
@@ -51,22 +43,26 @@ env/env.go                   EnvKey type + godotenv Load()
 1. **Card search** (default text handler): `RefreshStaleUserLists` refreshes users older than `CARD_LIST_REFRESH_HOURS` (default 3h) via 5-worker pool → `SearchCard` → format → split/send (4096-byte Telegram limit; `splitMessage` cuts on newlines, respects UTF-8 runes)
 2. **Registration** (`/deckbox <login>`): `RegisterUser` → `go GetProfileData(...)` fire-and-forget → scrape profile → save all 3 lists
 3. **Batch refresh** (`/suggestdeckbox <logins>`): 3-worker pool with `shouldProcessFn` freshness pre-filter
-4. **Wishlist search** (`/sell`): multi-line input, one card per line
+4. **Wishlist search** (`/sell`): multi-line input, one card per line; `SearchCards` runs the per-card queries concurrently (8 max) over the read pool and merges deterministically
 
 ### Storage design
 
 - **Dual connections**: `writeDB` (1 conn, serialized) + `readDB` (`max(4, NumCPU)` conns, parallel reads)
 - **WAL mode**: `PRAGMA journal_mode=WAL`, `synchronous=NORMAL`, `busy_timeout=5000`
-- **Batch inserts**: `SaveCardList` batches 1,000 cards per transaction (SQLite 32,766 param limit; 3 params/card → ~10,922 max per statement)
-- **FTS5**: virtual table `card_lists_fts` with `cardName_normalized` (NFD accent-stripped) for accent-insensitive prefix search; falls back to `LIKE` if unavailable
+- **Batch inserts**: `SaveCardList` streams the card map directly into batches of 1,000 per statement inside one transaction (clamped to 8,000 — SQLite's 32,766 param limit at 4 params/FTS row); the full-size batch statement is prepared once and reused
+- **FTS5**: virtual table `card_lists_fts(listId, cardName UNINDEXED, cardName_normalized, quantity UNINDEXED)` — `listId` is indexed so list replaces delete via `MATCH 'listId:<id>'` (no full-table scan); `cardName_normalized` (NFD accent-stripped) gives accent-insensitive prefix search with explicit `cardName_normalized:` column filters; `quantity` is stored so searches never join back to `card_lists`; falls back to `LIKE` if unavailable. `ensureFtsTable` auto-rebuilds the table from `card_lists` whenever the column layout (`ftsColumnSpec`) is outdated
+- **Prepared statement cache**: hot read/write queries are prepared once via `readStmt`/`writeStmt` and cached for the storage lifetime
+- **mmap**: custom `sqlite3_mmap` driver sets a 256 MB `mmap_size` per connection (no DSN param exists for it)
+- **Unchanged-list skip**: `saveCardListIfChanged` (handler layer) hashes the raw export body (FNV-64a, `CardList.BodyHash`) and skips the delete+insert when it matches the last successful save for that list; the cache is in-memory only and populated strictly after successful saves
 
 ### Scraper auth
 
-`Scraper` resolves the Deckbox `_tcg_session` cookie lazily in this order: in-memory cache → `DECKBOX_SESSION_COOKIE` override → persisted file (`<storage dir>/deckbox_session`, `0600`) → fresh login. `doLogin` GETs `/accounts/login` (cookie jar captures the session cookie, `parseAuthenticityToken` scrapes the Rails CSRF token), then POSTs credentials (302 = success). `FetchCardList` detects a rejected cookie (response is the login page) and calls `refreshCookie` to re-login once. A `sync.Mutex` serializes logins (single-flight) so the worker pools don't all authenticate at once.
+All profile/export fetches go through one shared `http.Transport` (keep-alive, 16 idle conns/host) via `fetchPage`, so worker pools reuse TLS connections instead of handshaking per request. `Scraper` resolves the Deckbox `_tcg_session` cookie lazily in this order: in-memory cache → `DECKBOX_SESSION_COOKIE` override → persisted file (`<storage dir>/deckbox_session`, `0600`) → fresh login. `doLogin` GETs `/accounts/login` (cookie jar captures the session cookie, `parseAuthenticityToken` scrapes the Rails CSRF token), then POSTs credentials (302 = success). `FetchCardList` detects a rejected cookie (response is the login page) and calls `refreshCookie` to re-login once. A `sync.Mutex` serializes logins (single-flight) so the worker pools don't all authenticate at once.
 
 ### Worker pool
 
 `runUserRefreshWorkerPool` is the reusable coordinator; `refreshUserListsWorker` fetches profile + 3 lists per user. Callers:
+
 - `RefreshStaleUserLists` — 5 workers, no filter
 - `SuggestDeckbox` — 3 workers + `shouldProcessFn` freshness check
 
@@ -79,6 +75,7 @@ env/env.go                   EnvKey type + godotenv Load()
 **Testing async handlers**: call worker functions directly (`GetProfileData`, `UpdateCardList`) or use mock `DeckboxSaver` + channels/waitgroups to observe side effects.
 
 **Adding a command**:
+
 1. Register in `main.go`: `b.RegisterHandler(bot.HandlerTypeMessageText, "/cmd", ...)`
 2. Extract context: `log := ctx.Value(logKey).(*slog.Logger)`
 3. Logic in `internal/deckbox/handler.go`
@@ -88,14 +85,14 @@ env/env.go                   EnvKey type + godotenv Load()
 
 ## Configuration (.env)
 
-| Variable | Required | Default | Description |
-|---|---|---|---|
-| `BOT_TOKEN` | yes | — | Telegram bot token |
-| `STORAGE_PATH` | yes | — | SQLite file path |
-| `DECKBOX_LOGIN` | yes* | — | Deckbox account login/email; bot logs in to obtain the session cookie |
-| `DECKBOX_PASSWORD` | yes* | — | Deckbox account password |
-| `DECKBOX_SESSION_COOKIE` | no | — | Optional manual `_tcg_session` override; used verbatim if set, skipping login |
-| `ENV` | yes | — | `local`/`dev` = DEBUG logs; `prod` = INFO |
+| Variable                 | Required | Default | Description                                                                   |
+| ------------------------ | -------- | ------- | ----------------------------------------------------------------------------- |
+| `BOT_TOKEN`              | yes      | —       | Telegram bot token                                                            |
+| `STORAGE_PATH`           | yes      | —       | SQLite file path                                                              |
+| `DECKBOX_LOGIN`          | yes\*    | —       | Deckbox account login/email; bot logs in to obtain the session cookie         |
+| `DECKBOX_PASSWORD`       | yes\*    | —       | Deckbox account password                                                      |
+| `DECKBOX_SESSION_COOKIE` | no       | —       | Optional manual `_tcg_session` override; used verbatim if set, skipping login |
+| `ENV`                    | yes      | —       | `local`/`dev` = DEBUG logs; `prod` = INFO                                     |
 
 \* Auth requires **either** `DECKBOX_LOGIN`+`DECKBOX_PASSWORD` **or** `DECKBOX_SESSION_COOKIE`; `MustLoad` fatals if neither is present.
 | `FRESHNESS_TIME_LIMIT_HOURS` | no | 24 | Hours before SuggestDeckbox treats data as stale |
@@ -105,3 +102,13 @@ env/env.go                   EnvKey type + godotenv Load()
 ## CI/CD
 
 GitHub Actions on push to `main`: `go test -tags fts5 -race ./...` → build+push image to `ghcr.io/crazyfen/friendlycardfinder` → SCP `docker-compose.yml` to VPS → `docker compose pull && up -d`. Secrets: `SSH_HOST`, `SSH_USER`, `SSH_PRIVATE_KEY`. VPS `.env` is maintained manually at `~/friendlycardfinder/`.
+
+## graphify
+
+This project has a graphify knowledge graph at graphify-out/.
+
+Rules:
+
+- Before answering architecture or codebase questions, read graphify-out/GRAPH_REPORT.md for god nodes and community structure
+- If graphify-out/wiki/index.md exists, navigate it instead of reading raw files
+- After modifying code files in this session, run `python3 -c "from graphify.watch import _rebuild_code; from pathlib import Path; _rebuild_code(Path('.'))"` to keep the graph current

@@ -1,8 +1,10 @@
 package deckbox
 
 import (
+	"bytes"
 	"context"
 	"fmt"
+	"hash/fnv"
 	"html"
 	"io"
 	"log/slog"
@@ -14,18 +16,82 @@ import (
 	"time"
 
 	"github.com/PuerkitoBio/goquery"
-	"github.com/gocolly/colly"
 )
 
 const sessionCookieName = "_tcg_session"
+
+const scraperUserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/58.0.3029.110 Safari/537.3"
+
+// fetchPage GETs a Deckbox page with retries and exponential backoff for
+// transient errors, returning the response body and the final URL after any
+// redirects (used to detect a bounce to the login page). All scrape fetches go
+// through the shared fetchClient so keep-alive connections are reused.
+func (s *Scraper) fetchPage(ctx context.Context, pageURL, cookie string, log *slog.Logger) (body []byte, finalURL *url.URL, err error) {
+	const maxAttempts = 3
+	for i := 0; i < maxAttempts; i++ {
+		select {
+		case <-ctx.Done():
+			return nil, nil, ctx.Err()
+		default:
+		}
+
+		body, finalURL, err = s.fetchPageOnce(ctx, pageURL, cookie)
+		if err == nil {
+			return body, finalURL, nil
+		}
+		log.Warn("fetch failed, retrying", slog.String("url", pageURL), slog.Int("attempt", i+1), slog.String("error", err.Error()))
+
+		select {
+		case <-ctx.Done():
+			return nil, nil, ctx.Err()
+		case <-time.After(time.Duration(200*(1<<i)) * time.Millisecond):
+		}
+	}
+	return nil, nil, err
+}
+
+func (s *Scraper) fetchPageOnce(ctx context.Context, pageURL, cookie string) ([]byte, *url.URL, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, pageURL, nil)
+	if err != nil {
+		return nil, nil, err
+	}
+	req.Header.Set("User-Agent", scraperUserAgent)
+	if cookie != "" {
+		req.AddCookie(&http.Cookie{Name: sessionCookieName, Value: cookie})
+	}
+
+	resp, err := s.fetchClient.Do(req)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, nil, err
+	}
+	if resp.StatusCode != http.StatusOK {
+		return nil, nil, fmt.Errorf("unexpected status %d for %s", resp.StatusCode, pageURL)
+	}
+	// resp.Request reflects the final request after redirects.
+	return body, resp.Request.URL, nil
+}
 
 func (s *Scraper) FetchDeckboxUserProfile(ctx context.Context, deckboxLogin string) (DeckboxUser, error) {
 	const op = "scrapper.FetchDeckboxUserProfile"
 	log := s.log.With(slog.String("operation", op), slog.String("deckbox_id", deckboxLogin))
 
-	c := colly.NewCollector(
-		colly.AllowedDomains("deckbox.org", "www.deckbox.org"),
-	)
+	body, _, err := s.fetchPage(ctx, ProfileURL+deckboxLogin, "", log)
+	if err != nil {
+		log.Error("failed to visit profile page", slog.String("error", err.Error()))
+		return DeckboxUser{}, err
+	}
+
+	doc, err := goquery.NewDocumentFromReader(bytes.NewReader(body))
+	if err != nil {
+		log.Error("failed to parse profile page", slog.String("error", err.Error()))
+		return DeckboxUser{}, err
+	}
 
 	user := DeckboxUser{
 		DeckboxLogin: deckboxLogin,
@@ -34,45 +100,20 @@ func (s *Scraper) FetchDeckboxUserProfile(ctx context.Context, deckboxLogin stri
 		WishlistID:   nil,
 	}
 
-	c.OnHTML("#section_mtg > .submenu_entry", func(e *colly.HTMLElement) {
-		log.Info("found submenu entry", slog.String("text", e.Text))
-		if class := e.Attr("class"); class != "" {
-			if strings.Contains(class, "t_wish") {
-				user.WishlistID, _ = extractIDFromElement(e)
-			} else if strings.Contains(class, "t_inv") {
-				user.InventoryID, _ = extractIDFromElement(e)
-			} else {
-				user.TradelistID, _ = extractIDFromElement(e)
-			}
+	doc.Find("#section_mtg > .submenu_entry").Each(func(_ int, sel *goquery.Selection) {
+		class, _ := sel.Attr("class")
+		if class == "" {
+			return
+		}
+		href, _ := sel.Find("a").First().Attr("href")
+		if strings.Contains(class, "t_wish") {
+			user.WishlistID, _ = extractIDFromHref(href)
+		} else if strings.Contains(class, "t_inv") {
+			user.InventoryID, _ = extractIDFromHref(href)
+		} else {
+			user.TradelistID, _ = extractIDFromHref(href)
 		}
 	})
-
-	// Retry on transient errors with exponential backoff
-	var err error
-	const maxAttempts = 3
-	for i := 0; i < maxAttempts; i++ {
-		select {
-		case <-ctx.Done():
-			return DeckboxUser{}, ctx.Err()
-		default:
-		}
-
-		err = c.Visit(ProfileURL + deckboxLogin)
-		if err == nil {
-			break
-		}
-		log.Warn("visit profile failed, retrying", slog.String("deckbox_id", deckboxLogin), slog.Int("attempt", i+1), slog.String("error", err.Error()))
-
-		select {
-		case <-ctx.Done():
-			return DeckboxUser{}, ctx.Err()
-		case <-time.After(time.Duration(200*(1<<i)) * time.Millisecond):
-		}
-	}
-	if err != nil {
-		log.Error("failed to visit profile page", slog.String("deckbox_id", deckboxLogin), slog.String("error", err.Error()))
-		return DeckboxUser{}, err
-	}
 
 	return user, nil
 }
@@ -115,80 +156,36 @@ func (s *Scraper) FetchCardList(ctx context.Context, listId int64) (CardList, er
 // returns authFailed=true when the response was the login page rather than the
 // export (an invalid/expired cookie), so the caller can re-login and retry.
 func (s *Scraper) fetchCardListOnce(ctx context.Context, listId int64, cookie string, log *slog.Logger) (CardList, bool, error) {
-	c := colly.NewCollector(
-		colly.AllowedDomains("deckbox.org", "www.deckbox.org"),
-	)
+	exportURL := ExportURL + strconv.FormatInt(listId, 10) + "/export"
 
-	c.UserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/58.0.3029.110 Safari/537.3"
-
-	c.OnRequest(func(r *colly.Request) {
-		c.SetCookies(r.URL.String(), []*http.Cookie{
-			{
-				Name:   sessionCookieName,
-				Value:  cookie,
-				Domain: r.URL.Host,
-				Path:   "/",
-			},
-		})
-	})
-
-	cardList := CardList{
-		ListId: listId,
-		Cards:  make(map[string]int16),
-	}
-	var authFailed bool
-
-	c.OnResponse(func(r *colly.Response) {
-		// An invalid cookie makes Deckbox redirect to the login page; colly
-		// follows redirects, so the final URL lands on /accounts/login.
-		if strings.HasSuffix(r.Request.URL.Path, "/accounts/login") {
-			authFailed = true
-			return
-		}
-
-		// The export is plain text ("<qty> <name>" joined by <br/>), so parse the
-		// raw response body directly. Registering no OnHTML handlers means colly
-		// never builds a goquery DOM, avoiding a full HTML parse plus the re-
-		// serialization that e.DOM.Html() used to cost on every card list.
-		body := bodyInnerHTML(string(r.Body))
-		// Belt-and-suspenders: detect the login form in the body too.
-		if strings.Contains(body, "name='authenticity_token'") || strings.Contains(body, `name="authenticity_token"`) {
-			authFailed = true
-			return
-		}
-		for cardName, quantity := range parseCardListExport(body, log) {
-			cardList.AddCard(cardName, quantity)
-		}
-	})
-
-	// Retry with a backoff for transient network errors
-	var err error
-	const maxAttempts = 3
-	for i := 0; i < maxAttempts; i++ {
-		select {
-		case <-ctx.Done():
-			return CardList{}, false, ctx.Err()
-		default:
-		}
-
-		err = c.Visit(ExportURL + fmt.Sprintf("%d", listId) + "/export")
-		if err == nil {
-			break
-		}
-		log.Warn("visit export failed, retrying", slog.Int("attempt", i+1), slog.String("error", err.Error()))
-
-		select {
-		case <-ctx.Done():
-			return CardList{}, false, ctx.Err()
-		case <-time.After(time.Duration(200*(1<<i)) * time.Millisecond):
-		}
-	}
+	rawBody, finalURL, err := s.fetchPage(ctx, exportURL, cookie, log)
 	if err != nil {
-		log.Error("failed to visit card list page", slog.Int64("list_id", listId), slog.String("error", err.Error()))
+		log.Error("failed to visit card list page", slog.String("error", err.Error()))
 		return CardList{}, false, err
 	}
 
-	return cardList, authFailed, nil
+	// An invalid cookie makes Deckbox redirect to the login page; the fetch
+	// client follows redirects, so the final URL lands on /accounts/login.
+	if strings.HasSuffix(finalURL.Path, "/accounts/login") {
+		return CardList{}, true, nil
+	}
+
+	// The export is plain text ("<qty> <name>" joined by <br/>), so parse the
+	// raw response body directly without building a DOM.
+	body := bodyInnerHTML(string(rawBody))
+	// Belt-and-suspenders: detect the login form in the body too.
+	if strings.Contains(body, "name='authenticity_token'") || strings.Contains(body, `name="authenticity_token"`) {
+		return CardList{}, true, nil
+	}
+
+	h := fnv.New64a()
+	h.Write([]byte(body))
+
+	return CardList{
+		ListId:   listId,
+		Cards:    parseCardListExport(body, log),
+		BodyHash: h.Sum64(),
+	}, false, nil
 }
 
 // cookie returns a usable _tcg_session value, resolving in priority order:
@@ -369,7 +366,9 @@ func bodyInnerHTML(s string) string {
 // entries separated by <br/> tags. Quantities for duplicate names are summed;
 // malformed entries are logged and skipped.
 func parseCardListExport(body string, log *slog.Logger) map[string]int16 {
-	cards := make(map[string]int16)
+	// Pre-size to the entry count so a 10k-card export doesn't rehash the map
+	// ~14 times while growing; one extra O(n) scan is far cheaper.
+	cards := make(map[string]int16, strings.Count(body, "<br/>")+1)
 	// TrimSpace on each element below also strips the stray newlines that the
 	// source formats into the export, so no whole-body copy is needed here.
 	for element := range strings.SplitSeq(body, "<br/>") {
@@ -394,10 +393,10 @@ func parseCardListExport(body string, log *slog.Logger) map[string]int16 {
 	return cards
 }
 
-func extractIDFromElement(e *colly.HTMLElement) (*int64, error) {
-	url := e.ChildAttr("a", "href")
+// extractIDFromHref parses a list href of the form "/sets/<id>" into the id.
+func extractIDFromHref(href string) (*int64, error) {
 	var id int64
-	_, err := fmt.Sscanf(url, "/sets/%d", &id)
+	_, err := fmt.Sscanf(href, "/sets/%d", &id)
 	if err != nil {
 		return nil, err
 	}

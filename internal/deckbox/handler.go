@@ -84,6 +84,32 @@ func GetProfileData(ctx context.Context, log *slog.Logger, storage DeckboxSaver,
 	log.Info("successfully updated profile data", slog.String("deckbox_id", deckboxLogin))
 }
 
+// savedListHashes remembers the BodyHash of the last successfully saved export
+// per listId, so refresh cycles skip the expensive delete+insert when the list
+// did not change on Deckbox (the common case). Entries are only written after a
+// successful save, and the cache starts empty on restart — so a skip can never
+// hide unsaved data.
+var savedListHashes sync.Map // map[int64]uint64
+
+// saveCardListIfChanged saves the list unless its body hash matches the last
+// successful save for that listId. Returns false only when saving failed.
+func saveCardListIfChanged(ctx context.Context, log *slog.Logger, storage DeckboxSaver, cardList CardList) bool {
+	if cardList.BodyHash != 0 {
+		if prev, ok := savedListHashes.Load(cardList.ListId); ok && prev.(uint64) == cardList.BodyHash {
+			log.Debug("card list unchanged, skipping save", slog.Int64("list_id", cardList.ListId))
+			return true
+		}
+	}
+	if err := storage.SaveCardList(ctx, cardList); err != nil {
+		log.Error("failed to save card list", sl.Err(err))
+		return false
+	}
+	if cardList.BodyHash != 0 {
+		savedListHashes.Store(cardList.ListId, cardList.BodyHash)
+	}
+	return true
+}
+
 func UpdateCardList(ctx context.Context, log *slog.Logger, storage DeckboxSaver, scraper *Scraper, listId int64) {
 	const op = "handlers.deckbox.UpdateCardList"
 	log = log.With(slog.String("operation", op), slog.Int64("list_id", listId))
@@ -102,10 +128,8 @@ func UpdateCardList(ctx context.Context, log *slog.Logger, storage DeckboxSaver,
 		return
 	}
 
-	// Save the card list to storage
-	err = storage.SaveCardList(ctx, cardList)
-	if err != nil {
-		log.Error("failed to save card list", sl.Err(err))
+	// Save the card list to storage (skipped when unchanged)
+	if !saveCardListIfChanged(ctx, log, storage, cardList) {
 		return
 	}
 
@@ -138,35 +162,23 @@ func refreshUserListsWorker(ctx context.Context, log *slog.Logger, storage Deckb
 
 	totalCards := 0
 
-	if user.InventoryID != nil {
-		cardList, err := scraper.FetchCardList(ctx, *user.InventoryID)
-		if err != nil {
-			log.Error("failed to fetch inventory", sl.Err(err))
-		} else if err = storage.SaveCardList(ctx, cardList); err != nil {
-			log.Error("failed to save inventory", sl.Err(err))
-		} else {
-			totalCards += len(cardList.Cards)
+	for _, l := range []struct {
+		name string
+		id   *int64
+	}{
+		{"inventory", user.InventoryID},
+		{"tradelist", user.TradelistID},
+		{"wishlist", user.WishlistID},
+	} {
+		if l.id == nil {
+			continue
 		}
-	}
-
-	if user.TradelistID != nil {
-		cardList, err := scraper.FetchCardList(ctx, *user.TradelistID)
+		cardList, err := scraper.FetchCardList(ctx, *l.id)
 		if err != nil {
-			log.Error("failed to fetch tradelist", sl.Err(err))
-		} else if err = storage.SaveCardList(ctx, cardList); err != nil {
-			log.Error("failed to save tradelist", sl.Err(err))
-		} else {
-			totalCards += len(cardList.Cards)
+			log.Error("failed to fetch "+l.name, sl.Err(err))
+			continue
 		}
-	}
-
-	if user.WishlistID != nil {
-		cardList, err := scraper.FetchCardList(ctx, *user.WishlistID)
-		if err != nil {
-			log.Error("failed to fetch wishlist", sl.Err(err))
-		} else if err = storage.SaveCardList(ctx, cardList); err != nil {
-			log.Error("failed to save wishlist", sl.Err(err))
-		} else {
+		if saveCardListIfChanged(ctx, log, storage, cardList) {
 			totalCards += len(cardList.Cards)
 		}
 	}
@@ -315,11 +327,32 @@ func SearchCards(ctx context.Context, log *slog.Logger, storage DeckboxSaver, ca
 	result := MultiCardSearchResult{SearchQueries: cardNames}
 	aggregates := make(map[int64]*UserSearchAggregate)
 
-	for _, name := range cardNames {
-		scr, err := SearchCard(ctx, log, storage, name, scope)
+	// Each card is an independent read query, so run them concurrently across
+	// the read connection pool. Results land in per-index slots and are merged
+	// sequentially below, keeping the output (incl. NotFound order) deterministic.
+	searchResults := make([]SearchCardResult, len(cardNames))
+	searchErrs := make([]error, len(cardNames))
+	sem := make(chan struct{}, 8)
+	var wg sync.WaitGroup
+	for i, name := range cardNames {
+		wg.Add(1)
+		go func(i int, name string) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			searchResults[i], searchErrs[i] = SearchCard(ctx, log, storage, name, scope)
+		}(i, name)
+	}
+	wg.Wait()
+
+	for _, err := range searchErrs {
 		if err != nil {
 			return MultiCardSearchResult{}, err
 		}
+	}
+
+	for i, name := range cardNames {
+		scr := searchResults[i]
 		if len(scr.SearchResults) == 0 {
 			result.NotFound = append(result.NotFound, name)
 			continue

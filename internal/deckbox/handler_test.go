@@ -13,6 +13,7 @@ import (
 type fakeStorage struct {
 	UpdateTimestampCalled bool
 	saveCardListErr       error
+	saveCardListCalls     int
 	getDeckboxUserFn      func(ctx context.Context, login string) (*DeckboxUser, error)
 	searchCardResults     []dto.CardSearchDTO
 	searchCardFn          func(cardName string) []dto.CardSearchDTO
@@ -21,6 +22,7 @@ type fakeStorage struct {
 func (f *fakeStorage) RegisterUser(ctx context.Context, user BotUser) error        { return nil }
 func (f *fakeStorage) SaveDeckboxUser(ctx context.Context, user DeckboxUser) error { return nil }
 func (f *fakeStorage) SaveCardList(ctx context.Context, list CardList) error {
+	f.saveCardListCalls++
 	return f.saveCardListErr
 }
 func (f *fakeStorage) ClearCardList(ctx context.Context, listId int64) error { return nil }
@@ -125,6 +127,73 @@ func TestRefreshWorkerProfileFetchError(t *testing.T) {
 	}
 	if storage.UpdateTimestampCalled {
 		t.Fatal("timestamp must not be updated when scraper fails")
+	}
+}
+
+// --- saveCardListIfChanged ---
+
+func TestSaveCardListIfChangedSkipsUnchanged(t *testing.T) {
+	// Unique listId per test: the hash cache is package-global.
+	const listId = int64(910001)
+	storage := &fakeStorage{}
+	ctx := context.Background()
+	list := CardList{ListId: listId, Cards: map[string]int16{"Bolt": 1}, BodyHash: 42}
+
+	if !saveCardListIfChanged(ctx, slog.Default(), storage, list) {
+		t.Fatal("first save should succeed")
+	}
+	if storage.saveCardListCalls != 1 {
+		t.Fatalf("expected 1 save call, got %d", storage.saveCardListCalls)
+	}
+
+	// Same hash again: must skip the save but still report success.
+	if !saveCardListIfChanged(ctx, slog.Default(), storage, list) {
+		t.Fatal("unchanged save should report success")
+	}
+	if storage.saveCardListCalls != 1 {
+		t.Fatalf("unchanged list must not be saved again, got %d calls", storage.saveCardListCalls)
+	}
+
+	// Changed hash: must save again.
+	list.BodyHash = 43
+	if !saveCardListIfChanged(ctx, slog.Default(), storage, list) {
+		t.Fatal("changed save should succeed")
+	}
+	if storage.saveCardListCalls != 2 {
+		t.Fatalf("changed list must be saved, got %d calls", storage.saveCardListCalls)
+	}
+}
+
+func TestSaveCardListIfChangedZeroHashAlwaysSaves(t *testing.T) {
+	const listId = int64(910002)
+	storage := &fakeStorage{}
+	ctx := context.Background()
+	list := CardList{ListId: listId, Cards: map[string]int16{"Bolt": 1}} // BodyHash 0
+
+	saveCardListIfChanged(ctx, slog.Default(), storage, list)
+	saveCardListIfChanged(ctx, slog.Default(), storage, list)
+	if storage.saveCardListCalls != 2 {
+		t.Fatalf("zero hash must never be skipped, got %d calls", storage.saveCardListCalls)
+	}
+}
+
+func TestSaveCardListIfChangedFailedSaveNotCached(t *testing.T) {
+	const listId = int64(910003)
+	storage := &fakeStorage{saveCardListErr: errors.New("disk full")}
+	ctx := context.Background()
+	list := CardList{ListId: listId, Cards: map[string]int16{"Bolt": 1}, BodyHash: 42}
+
+	if saveCardListIfChanged(ctx, slog.Default(), storage, list) {
+		t.Fatal("failed save must report failure")
+	}
+
+	// After the failure the hash must not be cached: the retry must save again.
+	storage.saveCardListErr = nil
+	if !saveCardListIfChanged(ctx, slog.Default(), storage, list) {
+		t.Fatal("retry save should succeed")
+	}
+	if storage.saveCardListCalls != 2 {
+		t.Fatalf("expected retry to hit storage, got %d calls", storage.saveCardListCalls)
 	}
 }
 
