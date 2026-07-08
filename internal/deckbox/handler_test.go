@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"sync"
 	"testing"
 	"time"
 )
@@ -17,6 +18,10 @@ type fakeStorage struct {
 	getDeckboxUserFn      func(ctx context.Context, login string) (*DeckboxUser, error)
 	searchCardResults     []dto.CardSearchDTO
 	searchCardFn          func(cardName string) []dto.CardSearchDTO
+
+	mu              sync.Mutex // guards lastSearch*: SearchCards calls SearchCard concurrently
+	lastSearchName  string
+	lastSearchExact bool
 }
 
 func (f *fakeStorage) RegisterUser(ctx context.Context, user BotUser) error        { return nil }
@@ -26,7 +31,11 @@ func (f *fakeStorage) SaveCardList(ctx context.Context, list CardList) error {
 	return f.saveCardListErr
 }
 func (f *fakeStorage) ClearCardList(ctx context.Context, listId int64) error { return nil }
-func (f *fakeStorage) SearchCard(ctx context.Context, cardName string, scope string) ([]dto.CardSearchDTO, error) {
+func (f *fakeStorage) SearchCard(ctx context.Context, cardName string, scope string, exact bool) ([]dto.CardSearchDTO, error) {
+	f.mu.Lock()
+	f.lastSearchName = cardName
+	f.lastSearchExact = exact
+	f.mu.Unlock()
 	if f.searchCardFn != nil {
 		return f.searchCardFn(cardName), nil
 	}
@@ -263,6 +272,68 @@ func TestSearchCardEmpty(t *testing.T) {
 	}
 }
 
+func TestParseExactQuery(t *testing.T) {
+	tests := []struct {
+		in        string
+		wantName  string
+		wantExact bool
+	}{
+		{`"Lightning Bolt"`, "Lightning Bolt", true},
+		{"«Shock»", "Shock", true},
+		{"“Opt”", "Opt", true},
+		{"„Opt“", "Opt", true},
+		{"„Opt”", "Opt", true},
+		{"'Opt'", "Opt", true},
+		{"‘Opt’", "Opt", true},
+		{` "Shock" `, "Shock", true},
+		{`" Shock "`, "Shock", true},
+		{"Lightning Bolt", "Lightning Bolt", false},
+		{`"unbalanced`, `"unbalanced`, false},
+		{`unbalanced"`, `unbalanced"`, false},
+		{`""`, `""`, false},
+		{`" "`, `" "`, false},
+		{"Urza's Saga", "Urza's Saga", false},
+		{"'Til Death Do Us Part", "'Til Death Do Us Part", false},
+	}
+	for _, tt := range tests {
+		gotName, gotExact := ParseExactQuery(tt.in)
+		if gotName != tt.wantName || gotExact != tt.wantExact {
+			t.Errorf("ParseExactQuery(%q) = (%q, %v), want (%q, %v)", tt.in, gotName, gotExact, tt.wantName, tt.wantExact)
+		}
+	}
+}
+
+func TestSearchCardQuotedQueryIsExact(t *testing.T) {
+	storage := &fakeStorage{}
+	result, err := SearchCard(context.Background(), slog.Default(), storage, `"Lightning Bolt"`, ScopeTradelist)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !storage.lastSearchExact {
+		t.Error("expected exact search for quoted query")
+	}
+	if storage.lastSearchName != "Lightning Bolt" {
+		t.Errorf("expected quotes stripped from storage query, got %q", storage.lastSearchName)
+	}
+	if result.SearchQuery != "Lightning Bolt" {
+		t.Errorf("expected quotes stripped from SearchQuery, got %q", result.SearchQuery)
+	}
+}
+
+func TestSearchCardUnquotedQueryIsNotExact(t *testing.T) {
+	storage := &fakeStorage{}
+	_, err := SearchCard(context.Background(), slog.Default(), storage, "Lightning Bolt", ScopeTradelist)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if storage.lastSearchExact {
+		t.Error("expected non-exact search for unquoted query")
+	}
+	if storage.lastSearchName != "Lightning Bolt" {
+		t.Errorf("expected query passed through unchanged, got %q", storage.lastSearchName)
+	}
+}
+
 // --- SearchCards (multi-card aggregation) ---
 
 func TestSearchCardsAggregatesByListId(t *testing.T) {
@@ -360,6 +431,32 @@ func TestSearchCardsSortOrder(t *testing.T) {
 		if got[i] != want[i] {
 			t.Errorf("order[%d]: want %q, got %q (full: %v)", i, want[i], got[i], got)
 		}
+	}
+}
+
+func TestSearchCardsStripsQuotes(t *testing.T) {
+	storage := &fakeStorage{
+		searchCardFn: func(cardName string) []dto.CardSearchDTO {
+			if cardName == "Bolt" {
+				return []dto.CardSearchDTO{{ListId: 1, DeckboxLogin: "alice", CardName: "Bolt", Quantity: 1}}
+			}
+			return nil
+		},
+	}
+	result, err := SearchCards(context.Background(), slog.Default(), storage, []string{`"Bolt"`, `"Shock"`}, ScopeTradelist)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	// Quoted lines are searched exactly, and both SearchQueries and NotFound
+	// echo the stripped names, matching the single-card path's SearchQuery.
+	if !storage.lastSearchExact {
+		t.Error("expected quoted lines to run as exact searches")
+	}
+	if len(result.SearchQueries) != 2 || result.SearchQueries[0] != "Bolt" || result.SearchQueries[1] != "Shock" {
+		t.Errorf("expected stripped SearchQueries [Bolt Shock], got %v", result.SearchQueries)
+	}
+	if len(result.NotFound) != 1 || result.NotFound[0] != "Shock" {
+		t.Errorf("expected stripped NotFound [Shock], got %v", result.NotFound)
 	}
 }
 

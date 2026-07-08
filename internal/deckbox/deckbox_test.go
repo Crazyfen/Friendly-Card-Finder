@@ -60,6 +60,9 @@ type mockOwnerStorage struct {
 	ownerFn func(ctx context.Context, listId int64) (*deckbox.CardListOwnerInfo, error)
 }
 
+// Compile-time check so interface changes can't silently orphan the mock.
+var _ deckbox.DeckboxSaver = (*mockOwnerStorage)(nil)
+
 func (m *mockOwnerStorage) RegisterUser(ctx context.Context, user deckbox.BotUser) error {
 	return nil
 }
@@ -70,7 +73,7 @@ func (m *mockOwnerStorage) SaveCardList(ctx context.Context, list deckbox.CardLi
 	return nil
 }
 func (m *mockOwnerStorage) ClearCardList(ctx context.Context, listId int64) error { return nil }
-func (m *mockOwnerStorage) SearchCard(ctx context.Context, cardName string, scope string) ([]dto.CardSearchDTO, error) {
+func (m *mockOwnerStorage) SearchCard(ctx context.Context, cardName string, scope string, exact bool) ([]dto.CardSearchDTO, error) {
 	return nil, nil
 }
 func (m *mockOwnerStorage) GetOwnerByListId(ctx context.Context, listId int64) (*deckbox.CardListOwnerInfo, error) {

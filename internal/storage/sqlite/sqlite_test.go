@@ -7,6 +7,8 @@ import (
 	"io"
 	"log/slog"
 	"os"
+	"sort"
+	"strings"
 	"testing"
 	"time"
 )
@@ -94,7 +96,7 @@ func TestFtsSchemaUpgrade(t *testing.T) {
 	}
 
 	for name, wantQty := range map[string]int16{"Lightning Bolt": 4, "Smeagol": 2} {
-		results, err := s2.SearchCard(ctx, name, deckbox.ScopeTradelist)
+		results, err := s2.SearchCard(ctx, name, deckbox.ScopeTradelist, false)
 		if err != nil {
 			t.Fatalf("search %q failed: %v", name, err)
 		}
@@ -154,7 +156,7 @@ func TestSaveCardListWithLargeCollection(t *testing.T) {
 	}
 
 	// Verify the cards were actually saved
-	results, err := storage.SearchCard(ctx, "Card_", deckbox.ScopeTradelist)
+	results, err := storage.SearchCard(ctx, "Card_", deckbox.ScopeTradelist, false)
 	if err != nil {
 		t.Fatalf("failed to search for cards: %v", err)
 	}
@@ -229,7 +231,7 @@ func TestSaveCardListBatching(t *testing.T) {
 
 			// Verify count matches
 			if tt.cardCount > 0 {
-				results, err := storage.SearchCard(ctx, "Card_", deckbox.ScopeTradelist)
+				results, err := storage.SearchCard(ctx, "Card_", deckbox.ScopeTradelist, false)
 				if err != nil {
 					t.Fatalf("failed to search: %v", err)
 				}
@@ -281,7 +283,7 @@ func TestSaveCardListTransactionRollback(t *testing.T) {
 	}
 
 	// Verify first save worked
-	results1, _ := storage.SearchCard(ctx, "ValidCard_", deckbox.ScopeTradelist)
+	results1, _ := storage.SearchCard(ctx, "ValidCard_", deckbox.ScopeTradelist, false)
 	if len(results1) != 2 {
 		t.Fatalf("expected 2 cards from first save, got %d", len(results1))
 	}
@@ -301,8 +303,8 @@ func TestSaveCardListTransactionRollback(t *testing.T) {
 	}
 
 	// Verify second save replaced the old cards
-	results2, _ := storage.SearchCard(ctx, "NewCard_", deckbox.ScopeTradelist)
-	oldResults, _ := storage.SearchCard(ctx, "ValidCard_", deckbox.ScopeTradelist)
+	results2, _ := storage.SearchCard(ctx, "NewCard_", deckbox.ScopeTradelist, false)
+	oldResults, _ := storage.SearchCard(ctx, "ValidCard_", deckbox.ScopeTradelist, false)
 
 	if len(results2) != 3 {
 		t.Errorf("expected 3 new cards, got %d", len(results2))
@@ -354,7 +356,7 @@ func TestSearchCardWithFTS(t *testing.T) {
 	}
 
 	// Search for 'shock' should match both 'Shock' and 'Shocking Grasp'
-	results, err := storage.SearchCard(ctx, "shock", deckbox.ScopeTradelist)
+	results, err := storage.SearchCard(ctx, "shock", deckbox.ScopeTradelist, false)
 	if err != nil {
 		t.Fatalf("search failed: %v", err)
 	}
@@ -364,7 +366,7 @@ func TestSearchCardWithFTS(t *testing.T) {
 	}
 
 	// Search for 'lightning' should match both Lightning cards
-	results2, err := storage.SearchCard(ctx, "lightning", deckbox.ScopeTradelist)
+	results2, err := storage.SearchCard(ctx, "lightning", deckbox.ScopeTradelist, false)
 	if err != nil {
 		t.Fatalf("search failed: %v", err)
 	}
@@ -384,7 +386,7 @@ func TestSearchCardWithFTS(t *testing.T) {
 		t.Fatalf("failed to save hyphenated card list: %v", err)
 	}
 
-	results3, err := storage.SearchCard(ctx, "Vitu-Ghazi Inspector", deckbox.ScopeTradelist)
+	results3, err := storage.SearchCard(ctx, "Vitu-Ghazi Inspector", deckbox.ScopeTradelist, false)
 	if err != nil {
 		t.Fatalf("search failed for hyphenated name: %v", err)
 	}
@@ -403,7 +405,7 @@ func TestSearchCardWithFTS(t *testing.T) {
 		t.Fatalf("failed to save accented card list: %v", err)
 	}
 
-	results4, err := storage.SearchCard(ctx, "smeagol", deckbox.ScopeTradelist)
+	results4, err := storage.SearchCard(ctx, "smeagol", deckbox.ScopeTradelist, false)
 	if err != nil {
 		t.Fatalf("search failed for accented name: %v", err)
 	}
@@ -422,13 +424,87 @@ func TestSearchCardWithFTS(t *testing.T) {
 		t.Fatalf("failed to save split card list: %v", err)
 	}
 
-	results5, err := storage.SearchCard(ctx, "//", deckbox.ScopeTradelist)
+	results5, err := storage.SearchCard(ctx, "//", deckbox.ScopeTradelist, false)
 	if err != nil {
 		t.Fatalf("search failed for split card name: %v", err)
 	}
 
 	if len(results5) < 1 {
 		t.Fatalf("expected at least 1 result for 'Umara Skyfalls', got %d", len(results5))
+	}
+}
+
+func TestSearchCardExact(t *testing.T) {
+	ctx := context.Background()
+	storage := newTestDB(t)
+
+	listID := int64(6000)
+	if err := storage.SaveDeckboxUser(ctx, deckbox.DeckboxUser{DeckboxLogin: "exactuser", TradelistID: &listID}); err != nil {
+		t.Fatalf("failed to save deckbox user: %v", err)
+	}
+	if err := storage.SaveCardList(ctx, deckbox.CardList{
+		ListId: listID,
+		Cards: map[string]int16{
+			"Shock":                  1,
+			"Sudden Shock":           2,
+			"Shocking Grasp":         3,
+			"Sméagol, Helpful Guide": 1,
+			"Vitu-Ghazi Inspector":   1,
+			"Fire // Ice":            1,
+			"Kraken 1½":              1,
+		},
+	}); err != nil {
+		t.Fatalf("failed to save card list: %v", err)
+	}
+
+	// Both modes must give identical exact semantics: FTS narrows via a phrase
+	// query + canonical post-filter, the fallback compares canonical_name() in
+	// SQL. No case is mode-specific.
+	tests := []struct {
+		name      string
+		query     string
+		wantNames []string
+	}{
+		{"filters prefix hits", "Shock", []string{"Shock"}},
+		{"case-insensitive", "shock", []string{"Shock"}},
+		{"multi-word", "Sudden Shock", []string{"Sudden Shock"}},
+		{"accent- and punctuation-insensitive", "smeagol helpful guide", []string{"Sméagol, Helpful Guide"}},
+		{"hyphen-insensitive", "Vitu Ghazi Inspector", []string{"Vitu-Ghazi Inspector"}},
+		{"partial name matches nothing", "Sudden", nil},
+		{"no tokens degrades to non-exact", "//", []string{"Fire // Ice"}},
+		{"non-decimal number category token", "kraken 1½", []string{"Kraken 1½"}},
+	}
+
+	ftsAvailable := storage.ftsEnabled
+	for _, mode := range []struct {
+		name string
+		fts  bool
+	}{{"fts", true}, {"like-fallback", false}} {
+		t.Run(mode.name, func(t *testing.T) {
+			if mode.fts && !ftsAvailable {
+				t.Skip("FTS5 not enabled in this sqlite build")
+			}
+			storage.ftsEnabled = mode.fts
+
+			for _, tt := range tests {
+				t.Run(tt.name, func(t *testing.T) {
+					results, err := storage.SearchCard(ctx, tt.query, deckbox.ScopeTradelist, true)
+					if err != nil {
+						t.Fatalf("exact search %q failed: %v", tt.query, err)
+					}
+					got := make([]string, 0, len(results))
+					for _, r := range results {
+						got = append(got, r.CardName)
+					}
+					sort.Strings(got)
+					want := append([]string(nil), tt.wantNames...)
+					sort.Strings(want)
+					if strings.Join(got, "|") != strings.Join(want, "|") {
+						t.Errorf("exact search %q: got %v, want %v", tt.query, got, want)
+					}
+				})
+			}
+		})
 	}
 }
 
@@ -466,7 +542,7 @@ func TestSearchCardWishlist(t *testing.T) {
 	}
 
 	// Search in wishlist scope - should find
-	res, err := storage.SearchCard(ctx, "WishCard", deckbox.ScopeWishlist)
+	res, err := storage.SearchCard(ctx, "WishCard", deckbox.ScopeWishlist, false)
 	if err != nil {
 		t.Fatalf("search failed: %v", err)
 	}
@@ -475,7 +551,7 @@ func TestSearchCardWishlist(t *testing.T) {
 	}
 
 	// Search in tradelist scope - should NOT find
-	res2, err := storage.SearchCard(ctx, "WishCard", deckbox.ScopeTradelist)
+	res2, err := storage.SearchCard(ctx, "WishCard", deckbox.ScopeTradelist, false)
 	if err != nil {
 		t.Fatalf("search failed: %v", err)
 	}
@@ -687,7 +763,7 @@ func TestClearCardList(t *testing.T) {
 		t.Fatalf("save list: %v", err)
 	}
 
-	results, _ := s.SearchCard(ctx, "Bolt", deckbox.ScopeTradelist)
+	results, _ := s.SearchCard(ctx, "Bolt", deckbox.ScopeTradelist, false)
 	if len(results) == 0 {
 		t.Fatal("expected card before clear")
 	}
@@ -696,7 +772,7 @@ func TestClearCardList(t *testing.T) {
 		t.Fatalf("clear failed: %v", err)
 	}
 
-	results, _ = s.SearchCard(ctx, "Bolt", deckbox.ScopeTradelist)
+	results, _ = s.SearchCard(ctx, "Bolt", deckbox.ScopeTradelist, false)
 	if len(results) != 0 {
 		t.Fatalf("expected 0 results after clear, got %d", len(results))
 	}
@@ -847,7 +923,7 @@ func benchmarkSearchCard(b *testing.B, wantFTS bool) {
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		if _, err := storage.SearchCard(ctx, "Card_", deckbox.ScopeTradelist); err != nil {
+		if _, err := storage.SearchCard(ctx, "Card_", deckbox.ScopeTradelist, false); err != nil {
 			b.Fatalf("search failed: %v", err)
 		}
 	}

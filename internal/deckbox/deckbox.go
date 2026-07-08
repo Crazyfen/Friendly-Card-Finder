@@ -93,7 +93,7 @@ type DeckboxSaver interface {
 	SaveDeckboxUser(ctx context.Context, user DeckboxUser) error
 	SaveCardList(ctx context.Context, list CardList) error
 	ClearCardList(ctx context.Context, listId int64) error
-	SearchCard(ctx context.Context, cardName string, scope string) ([]dto.CardSearchDTO, error)
+	SearchCard(ctx context.Context, cardName string, scope string, exact bool) ([]dto.CardSearchDTO, error)
 	GetOwnerByListId(ctx context.Context, listId int64) (*CardListOwnerInfo, error)
 	GetDeckboxUser(ctx context.Context, deckboxLogin string) (*DeckboxUser, error)
 	UpdateDeckboxUserTimestamp(ctx context.Context, deckboxLogin string, updatedAt int64) error

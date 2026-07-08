@@ -280,11 +280,47 @@ func RefreshStaleUserLists(ctx context.Context, log *slog.Logger, storage Deckbo
 	log.Info("completed refresh of stale user lists")
 }
 
-func SearchCard(ctx context.Context, log *slog.Logger, storage DeckboxSaver, cardName string, scope string) (SearchCardResult, error) {
-	const op = "handlers.deckbox.SearchCard"
-	log = log.With(slog.String("operation", op), slog.String("card_name", cardName), slog.String("scope", scope))
+// exactQuotePairs are the quote styles recognized as an exact-match request:
+// straight double/single quotes plus the smart, guillemet, and low-9 pairs
+// that mobile keyboards substitute in different locales. Single quotes are
+// safe as a pair because no card name both starts and ends with an apostrophe.
+var exactQuotePairs = []struct{ open, close string }{
+	{`"`, `"`},
+	{"'", "'"},
+	{"«", "»"},
+	{"“", "”"},
+	{"‘", "’"},
+	{"„", "“"}, // German/Czech low-9
+	{"„", "”"}, // Polish/Dutch/Hungarian low-9
+}
 
-	results, err := storage.SearchCard(ctx, cardName, scope)
+// ParseExactQuery reports whether the query is wrapped in matching quotes
+// (an exact-match request) and returns it with the quotes stripped.
+func ParseExactQuery(q string) (string, bool) {
+	q = strings.TrimSpace(q)
+	for _, p := range exactQuotePairs {
+		if len(q) > len(p.open)+len(p.close) && strings.HasPrefix(q, p.open) && strings.HasSuffix(q, p.close) {
+			if inner := strings.TrimSpace(q[len(p.open) : len(q)-len(p.close)]); inner != "" {
+				return inner, true
+			}
+		}
+	}
+	return q, false
+}
+
+func SearchCard(ctx context.Context, log *slog.Logger, storage DeckboxSaver, cardName string, scope string) (SearchCardResult, error) {
+	cardName, exact := ParseExactQuery(cardName)
+	return searchCardParsed(ctx, log, storage, cardName, exact, scope)
+}
+
+// searchCardParsed runs a single already-parsed query. Callers must have
+// applied ParseExactQuery first so the quote-stripped name — not the raw
+// input — is what gets searched, logged, and echoed back in SearchQuery.
+func searchCardParsed(ctx context.Context, log *slog.Logger, storage DeckboxSaver, cardName string, exact bool, scope string) (SearchCardResult, error) {
+	const op = "handlers.deckbox.SearchCard"
+	log = log.With(slog.String("operation", op), slog.String("card_name", cardName), slog.String("scope", scope), slog.Bool("exact", exact))
+
+	results, err := storage.SearchCard(ctx, cardName, scope, exact)
 	if err != nil {
 		log.Error("failed to search card", sl.Err(err))
 		return SearchCardResult{}, err
@@ -324,24 +360,33 @@ func SearchCards(ctx context.Context, log *slog.Logger, storage DeckboxSaver, ca
 	const op = "handlers.deckbox.SearchCards"
 	log = log.With(slog.String("operation", op), slog.Int("card_count", len(cardNames)), slog.String("scope", scope))
 
-	result := MultiCardSearchResult{SearchQueries: cardNames}
+	// Parse quoting once up front so the stripped names — not the raw quoted
+	// lines — are what the searches run on and what SearchQueries and NotFound
+	// echo back, matching the single-card path's SearchQuery.
+	names := make([]string, len(cardNames))
+	exacts := make([]bool, len(cardNames))
+	for i, raw := range cardNames {
+		names[i], exacts[i] = ParseExactQuery(raw)
+	}
+
+	result := MultiCardSearchResult{SearchQueries: names}
 	aggregates := make(map[int64]*UserSearchAggregate)
 
 	// Each card is an independent read query, so run them concurrently across
 	// the read connection pool. Results land in per-index slots and are merged
 	// sequentially below, keeping the output (incl. NotFound order) deterministic.
-	searchResults := make([]SearchCardResult, len(cardNames))
-	searchErrs := make([]error, len(cardNames))
+	searchResults := make([]SearchCardResult, len(names))
+	searchErrs := make([]error, len(names))
 	sem := make(chan struct{}, 8)
 	var wg sync.WaitGroup
-	for i, name := range cardNames {
+	for i := range names {
 		wg.Add(1)
-		go func(i int, name string) {
+		go func(i int) {
 			defer wg.Done()
 			sem <- struct{}{}
 			defer func() { <-sem }()
-			searchResults[i], searchErrs[i] = SearchCard(ctx, log, storage, name, scope)
-		}(i, name)
+			searchResults[i], searchErrs[i] = searchCardParsed(ctx, log, storage, names[i], exacts[i], scope)
+		}(i)
 	}
 	wg.Wait()
 
@@ -351,7 +396,7 @@ func SearchCards(ctx context.Context, log *slog.Logger, storage DeckboxSaver, ca
 		}
 	}
 
-	for i, name := range cardNames {
+	for i, name := range names {
 		scr := searchResults[i]
 		if len(scr.SearchResults) == 0 {
 			result.NotFound = append(result.NotFound, name)

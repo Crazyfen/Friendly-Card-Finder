@@ -16,9 +16,10 @@ var translations = map[string]map[string]string{
 
 <b>Как искать</b>
 Просто отправь название карты (можно несколько строк — по одной карточке на строку). Бот найдёт совпадения в трейдлистах зарегистрированных пользователей.
+Нужно точное совпадение названия — возьми его в кавычки: <code>"Shock"</code>.
 
 <b>Как продавать / искать в вишлистах</b>
-Отправь <code>/sell &lt;название_карты&gt;</code> — я поищу совпадения в вишлистах зарегистрированных пользователей (поддерживается несколько строк — по одной карточке на строку).
+Отправь <code>/sell &lt;название_карты&gt;</code> — я поищу совпадения в вишлистах зарегистрированных пользователей (поддерживается несколько строк — по одной карточке на строку). Кавычки работают и здесь: строка в кавычках ищется по точному названию.
 
 <b>Предложить пользователей Deckbox</b>
 Отправь <code>/suggestdeckbox</code> и перечисли логины по одному на строку — бот обновит их списки.
@@ -55,9 +56,10 @@ Send <code>/deckbox &lt;your_login&gt;</code> — I'll save your account and fet
 
 <b>How to search</b>
 Just send a card name (can be multiple lines — one card per line). The bot will find matches in the tradelists of registered users.
+For an exact name match, wrap it in quotes: <code>"Shock"</code>.
 
 <b>How to sell / search wishlists</b>
-Send <code>/sell &lt;card_name&gt;</code> — I'll search wishlists of registered users (supports multiple lines — one card per line).
+Send <code>/sell &lt;card_name&gt;</code> — I'll search wishlists of registered users (supports multiple lines — one card per line). Quotes work here too: a quoted line is matched by exact name.
 
 <b>Suggest Deckbox users</b>
 Send <code>/suggestdeckbox</code> and list logins one per line — the bot will update their lists.

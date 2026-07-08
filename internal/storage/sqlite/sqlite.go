@@ -35,6 +35,12 @@ const driverName = "sqlite3_mmap"
 func init() {
 	sql.Register(driverName, &sqlite3.SQLiteDriver{
 		ConnectHook: func(conn *sqlite3.SQLiteConn) error {
+			// canonical_name backs exact search on the non-FTS fallback path
+			// (see SearchCard), keeping its equality semantics — case-, accent-
+			// and punctuation-insensitive — identical to the FTS build.
+			if err := conn.RegisterFunc("canonical_name", canonicalCardName, true); err != nil {
+				return err
+			}
 			_, err := conn.Exec("PRAGMA mmap_size=268435456", nil)
 			return err
 		},
@@ -517,7 +523,7 @@ func (s *SQLiteStorage) ClearCardList(ctx context.Context, listId int64) error {
 	return nil
 }
 
-func (s *SQLiteStorage) SearchCard(ctx context.Context, cardName string, scope string) ([]dto.CardSearchDTO, error) {
+func (s *SQLiteStorage) SearchCard(ctx context.Context, cardName string, scope string, exact bool) ([]dto.CardSearchDTO, error) {
 	const op = "storage.sqlite.SearchCard"
 
 	// determine which deckbox_users column to join on based on scope
@@ -529,13 +535,31 @@ func (s *SQLiteStorage) SearchCard(ctx context.Context, cardName string, scope s
 		column = "inventoryId"
 	}
 
+	// Canonicalize the query once: the same string serves as the FTS phrase
+	// body, the fallback's canonical_name() argument, and the per-row equality
+	// filter below. A query with no tokens (all punctuation, e.g. a quoted
+	// "//") has no canonical form to compare against, so it degrades to a
+	// regular non-exact search instead of filtering every row out.
+	var wantCanonical string
+	if exact {
+		wantCanonical = canonicalCardName(cardName)
+		if wantCanonical == "" {
+			exact = false
+		}
+	}
+
 	var rows *sql.Rows
 
 	// Prefer FTS5 based search for better performance and tokenized prefix matching.
 	// Fall back to LIKE when FTS is disabled or the query reduces to no tokens
 	// (e.g. an all-punctuation input like "//"), so callers always get LIKE semantics.
 	if s.ftsEnabled {
-		matchQuery := buildFtsQueryTerm(cardName)
+		var matchQuery string
+		if exact {
+			matchQuery = ftsPhraseQuery(wantCanonical)
+		} else {
+			matchQuery = buildFtsQueryTerm(cardName)
+		}
 		if matchQuery != "" {
 			// Match against normalized column to support accent-insensitive matching.
 			// quantity is stored in the FTS table, so no join back to card_lists.
@@ -563,22 +587,36 @@ func (s *SQLiteStorage) SearchCard(ctx context.Context, cardName string, scope s
 	}
 
 	if rows == nil {
+		// Fallback path (FTS disabled or the query has no tokens). Exact search
+		// compares canonical forms via the canonical_name() Go function
+		// registered in the ConnectHook, so exactness ignores case, accents,
+		// and punctuation just like the FTS build. Both variants scan the
+		// table (a leading-wildcard LIKE cannot use an index either).
+		var predicate string
+		var arg string
+		if exact {
+			predicate = "canonical_name(cl.cardName) = ?"
+			arg = wantCanonical
+		} else {
+			predicate = "cl.cardName LIKE ?"
+			arg = "%" + cardName + "%"
+		}
 		sqlStmt := fmt.Sprintf(`
 		SELECT cl.listId, cl.cardName COLLATE NOCASE, cl.quantity,
 		       du.deckboxLogin, u.telegramId, u.username
 		FROM card_lists AS cl
 		JOIN deckbox_users AS du ON cl.listId = du.%s
 		LEFT JOIN users AS u ON du.deckboxLogin = u.deckboxLogin
-		WHERE cl.cardName LIKE ?
+		WHERE %s
 		ORDER BY cl.listId ASC
-		`, column)
+		`, column, predicate)
 
 		stmt, err := s.readStmt(ctx, sqlStmt)
 		if err != nil {
 			return nil, fmt.Errorf("%s: %w", op, err)
 		}
 
-		rows, err = stmt.QueryContext(ctx, "%"+cardName+"%")
+		rows, err = stmt.QueryContext(ctx, arg)
 		if err != nil {
 			return nil, fmt.Errorf("%s: %w", op, err)
 		}
@@ -588,19 +626,26 @@ func (s *SQLiteStorage) SearchCard(ctx context.Context, cardName string, scope s
 	var results []dto.CardSearchDTO
 	for rows.Next() {
 		var listId int64
-		var cardName string
+		var rowCardName string
 		var quantity int16
 		var deckboxLogin string
 		var telegramId *int64
 		var username *string
-		err := rows.Scan(&listId, &cardName, &quantity, &deckboxLogin, &telegramId, &username)
+		err := rows.Scan(&listId, &rowCardName, &quantity, &deckboxLogin, &telegramId, &username)
 		if err != nil {
 			return nil, fmt.Errorf("%s: %w", op, err)
 		}
 
+		// The FTS phrase match may return names that merely contain the query
+		// ("Sudden Shock" for "shock"), so exact search keeps only rows whose
+		// canonical token form equals the query's.
+		if exact && canonicalCardName(rowCardName) != wantCanonical {
+			continue
+		}
+
 		results = append(results, dto.CardSearchDTO{
 			ListId:           listId,
-			CardName:         cardName,
+			CardName:         rowCardName,
 			Quantity:         quantity,
 			DeckboxLogin:     deckboxLogin,
 			TelegramID:       telegramId,
@@ -658,6 +703,9 @@ func (s *SQLiteStorage) GetOwnerByListId(ctx context.Context, listId int64) (*de
 //     table directly instead of joining every matched row back to card_lists.
 const ftsColumnSpec = `(listId, cardName UNINDEXED, cardName_normalized, quantity UNINDEXED)`
 
+// The table uses the default unicode61 tokenizer. queryTokens mirrors its
+// token boundaries in Go for phrase queries and canonical comparison — any
+// tokenize option added here must be reflected there.
 const ftsCreateSQL = `CREATE VIRTUAL TABLE IF NOT EXISTS card_lists_fts USING fts5` + ftsColumnSpec + `;`
 
 // ensureFtsTable attempts to create the FTS5 virtual table for fast searching.
@@ -767,46 +815,67 @@ func ftsListIdQuery(listId int64) string {
 	return "listId:" + strconv.FormatInt(listId, 10)
 }
 
+// queryTokens splits a search string or card name into normalized (lowercase,
+// accent-stripped) tokens, mirroring how the FTS5 unicode61 tokenizer splits
+// stored card names: unicode61 treats all Unicode letter (L*) and number (N*)
+// categories as token characters, hence unicode.IsNumber (Nd+Nl+No, e.g. "½")
+// rather than unicode.IsDigit. Everything else (punctuation such as a hyphen)
+// becomes a token boundary, so "Vitu-Ghazi" produces two tokens. If tokenizer
+// options are ever added to ftsCreateSQL, this function must change in
+// lockstep or exact phrase queries will silently stop matching.
+func queryTokens(q string) []string {
+	parts := strings.Fields(q)
+	tokens := make([]string, 0, len(parts))
+	for _, p := range parts {
+		cleaned := strings.Map(func(r rune) rune {
+			if unicode.IsLetter(r) || unicode.IsNumber(r) {
+				return r
+			}
+			return ' '
+		}, p)
+		for sp := range strings.FieldsSeq(cleaned) {
+			if norm := normalizeASCII(sp); norm != "" {
+				tokens = append(tokens, norm)
+			}
+		}
+	}
+	return tokens
+}
+
 // buildFtsQueryTerm converts a user search string into an FTS5 MATCH query
 // supporting prefix matching for each term (e.g., "light" ->
 // "cardName_normalized:light*"). Every term carries an explicit column filter
 // so numeric card-name searches can never match the indexed listId column.
 func buildFtsQueryTerm(q string) string {
-	q = strings.TrimSpace(q)
-	if q == "" {
-		return ""
-	}
-
-	// Normalize: split into parts, replace non-alphanumeric characters with spaces,
-	// then ASCII-normalize and lower-case each token so accents don't prevent matches.
-	parts := strings.Fields(q)
-	tokens := make([]string, 0, len(parts))
-	for _, p := range parts {
-		cleaned := strings.Map(func(r rune) rune {
-			if unicode.IsLetter(r) || unicode.IsDigit(r) {
-				return r
-			}
-			// replace punctuation (e.g., hyphen) with space so names like "Vitu-Ghazi" become two tokens
-			return ' '
-		}, p)
-		for sp := range strings.FieldsSeq(cleaned) {
-			// strip any leftover quotes just in case
-			sp = strings.ReplaceAll(sp, "'", "")
-			sp = strings.ReplaceAll(sp, "\"", "")
-			if sp != "" {
-				norm := normalizeASCII(sp)
-				if norm != "" {
-					tokens = append(tokens, "cardName_normalized:"+norm+"*")
-				}
-			}
-		}
-	}
-
+	tokens := queryTokens(q)
 	if len(tokens) == 0 {
 		return ""
 	}
+	terms := make([]string, len(tokens))
+	for i, t := range tokens {
+		terms[i] = "cardName_normalized:" + t + "*"
+	}
 	// Use AND to require all tokens to match
-	return strings.Join(tokens, " AND ")
+	return strings.Join(terms, " AND ")
+}
+
+// ftsPhraseQuery wraps a canonical card name (see canonicalCardName) in an
+// FTS5 phrase query, e.g. "lightning bolt" -> `cardName_normalized:"lightning
+// bolt"`. The phrase narrows candidates through the index; true exact equality
+// is enforced by the canonicalCardName post-filter in SearchCard, because a
+// phrase also matches names containing it with extra tokens ("Sudden Shock"
+// for "shock"). Canonical tokens contain only letter/number runes, so
+// embedding them in the quoted phrase is safe.
+func ftsPhraseQuery(canonical string) string {
+	return `cardName_normalized:"` + canonical + `"`
+}
+
+// canonicalCardName reduces a card name to its normalized token sequence
+// ("Vitu-Ghazi, the City-Tree" -> "vitu ghazi the city tree"), so exact-match
+// comparison ignores case, accents, and punctuation the same way FTS matching
+// does.
+func canonicalCardName(s string) string {
+	return strings.Join(queryTokens(s), " ")
 }
 
 // normalizerPool holds NFD→strip-combining-marks→NFC transformer chains. Building
