@@ -1,7 +1,6 @@
 // Package admin serves the Admin Panel: a manage page for Deckbox Users and an
 // analytics page for Demand and Trade Matches. It renders values the deckbox
-// package produces and never touches storage itself — the same seam that keeps
-// Purge's BodyHash invalidation from being bypassed. See docs/adr/0003.
+// package produces and never touches storage itself. See docs/adr/0003.
 package admin
 
 import (
@@ -245,16 +244,18 @@ func (s *Server) handleUnlink(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleRefresh(w http.ResponseWriter, r *http.Request) {
-	s.refresh(w, r, strings.TrimSpace(r.FormValue("login")), "refreshed")
+	s.refresh(w, r, strings.TrimSpace(r.FormValue("login")), "refresh", "refreshed")
 }
 
 // handleAdd is the same operation as refresh — a Refresh of an unknown login
-// creates the Deckbox User — so it shares the path rather than duplicating it.
+// creates the Deckbox User — so it shares the path and differs only in wording.
 func (s *Server) handleAdd(w http.ResponseWriter, r *http.Request) {
-	s.refresh(w, r, strings.TrimSpace(r.FormValue("login")), "added")
+	s.refresh(w, r, strings.TrimSpace(r.FormValue("login")), "add", "added")
 }
 
-func (s *Server) refresh(w http.ResponseWriter, r *http.Request, login, verb string) {
+// refresh reports the action twice over: "refresh petya failed: ..." while it is
+// happening, "refreshed petya" once it has.
+func (s *Server) refresh(w http.ResponseWriter, r *http.Request, login, present, past string) {
 	if login == "" {
 		s.redirect(w, r, "no login given")
 		return
@@ -264,11 +265,11 @@ func (s *Server) refresh(w http.ResponseWriter, r *http.Request, login, verb str
 	defer cancel()
 
 	if err := s.svc.RefreshNow(ctx, login); err != nil {
-		s.redirect(w, r, fmt.Sprintf("%s %s failed: %v", strings.TrimSuffix(verb, "ed"), login, err))
+		s.redirect(w, r, fmt.Sprintf("%s %s failed: %v", present, login, err))
 		return
 	}
 	s.invalidate()
-	s.redirect(w, r, verb+" "+login)
+	s.redirect(w, r, past+" "+login)
 }
 
 // redirect implements POST-then-redirect so a reload never repeats an action.

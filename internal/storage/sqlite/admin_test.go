@@ -45,6 +45,40 @@ func seedUser(t *testing.T, s *SQLiteStorage, login string, base int64, register
 	}
 }
 
+func TestPurgeDropsStoredBodyHash(t *testing.T) {
+	// The stored hash dies with the rows it describes. If it survived, a
+	// re-registration of the same login would fetch the same unchanged export,
+	// be skipped as "unchanged", and stay permanently empty.
+	ctx := context.Background()
+	s := newTestDB(t)
+
+	const listID = int64(300)
+	list := deckbox.CardList{
+		ListId:   listID,
+		Cards:    map[string]int16{"Lightning Bolt": 2},
+		BodyHash: 42,
+	}
+
+	seedTradelist(t, s, "petya", listID)
+	if err := s.SaveCardList(ctx, list); err != nil {
+		t.Fatalf("save card list: %v", err)
+	}
+
+	if _, err := s.PurgeDeckboxUser(ctx, "petya"); err != nil {
+		t.Fatalf("purge failed: %v", err)
+	}
+
+	// Re-registration: same login, same list, byte-identical export.
+	seedTradelist(t, s, "petya", listID)
+	if err := s.SaveCardList(ctx, list); err != nil {
+		t.Fatalf("re-save card list: %v", err)
+	}
+
+	if found := searchCards(t, s, ctx, "Lightning Bolt", deckbox.ScopeTradelist, false); len(found) != 1 {
+		t.Errorf("re-registration after a purge stayed empty: %v", found)
+	}
+}
+
 func TestPurgeDeckboxUser(t *testing.T) {
 	// A Purge has to clear every table the user appears in. Missing one leaves
 	// rows that searches still find or that the panel still counts.
@@ -58,7 +92,7 @@ func TestPurgeDeckboxUser(t *testing.T) {
 	}
 
 	if len(res.ListIDs) != 3 {
-		t.Errorf("expected 3 list ids returned for hash invalidation, got %v", res.ListIDs)
+		t.Errorf("expected 3 list ids reported, got %v", res.ListIDs)
 	}
 	if res.CardRows != 6 {
 		t.Errorf("expected 6 card rows deleted, got %d", res.CardRows)
@@ -185,7 +219,7 @@ func TestRecordSearchUpsert(t *testing.T) {
 
 	byKey := map[string]deckbox.TermDemand{}
 	for _, d := range insights.TopMisses {
-		byKey[d.Term+"|"+d.Scope] = d
+		byKey[d.Term+"|"+string(d.Scope)] = d
 	}
 
 	if len(byKey) != 3 {

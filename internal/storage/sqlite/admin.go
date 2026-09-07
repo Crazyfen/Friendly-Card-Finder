@@ -55,7 +55,7 @@ func (s *SQLiteStorage) RecordSearch(ctx context.Context, terms []deckbox.TermSt
 			hits      = search_stats.hits + excluded.hits,
 			misses    = search_stats.misses + excluded.misses,
 			last_seen = excluded.last_seen`,
-			key, t.Scope, t.Term, hit, miss, now.Unix()); err != nil {
+			key, string(t.Scope), t.Term, hit, miss, now.Unix()); err != nil {
 			return fmt.Errorf("%s: search_stats: %w", op, err)
 		}
 	}
@@ -125,10 +125,11 @@ func (s *SQLiteStorage) SaveRefreshOutcome(ctx context.Context, o deckbox.Refres
 }
 
 // PurgeDeckboxUser removes a Deckbox User and everything about them: the three
-// Card Lists' rows, the FTS rows, the snapshots, the user, and the Bot User
-// registration claiming that login. The returned ListIDs let the caller drop
-// the matching BodyHash cache entries — without that, a re-registration of the
-// same login would be skipped as "unchanged" and stay empty.
+// Card Lists' rows, the FTS rows, the stored body hashes, the snapshots, the
+// user, and the Bot User registration claiming that login. Dropping the hash
+// alongside the rows is what lets a re-registration of the same login refill
+// the collection instead of being skipped as "unchanged". ListIDs is reported
+// so the caller can say how many Card Lists went.
 func (s *SQLiteStorage) PurgeDeckboxUser(ctx context.Context, login string) (deckbox.PurgeResult, error) {
 	const op = "storage.sqlite.PurgeDeckboxUser"
 
@@ -171,6 +172,10 @@ func (s *SQLiteStorage) PurgeDeckboxUser(ctx context.Context, login string) (dec
 			if _, err := tx.ExecContext(ctx, `DELETE FROM card_lists_fts WHERE card_lists_fts MATCH ?`, ftsListIdQuery(*id)); err != nil {
 				return result, fmt.Errorf("%s: card_lists_fts: %w", op, err)
 			}
+		}
+
+		if _, err := tx.ExecContext(ctx, `DELETE FROM card_list_hashes WHERE listId = ?`, *id); err != nil {
+			return result, fmt.Errorf("%s: card_list_hashes: %w", op, err)
 		}
 
 		if _, err := tx.ExecContext(ctx, `DELETE FROM list_snapshots WHERE listId = ?`, *id); err != nil {
@@ -329,7 +334,9 @@ func (s *SQLiteStorage) AdminInsights(ctx context.Context) (deckbox.Insights, er
 	LIMIT ?`, []any{insightsLimit},
 		func(r *sql.Rows) (deckbox.TermDemand, error) {
 			var t deckbox.TermDemand
-			err := r.Scan(&t.Term, &t.Scope, &t.Hits, &t.Misses, &t.LastSeen)
+			var scope string // Scope is a named type; the driver only scans into *string
+			err := r.Scan(&t.Term, &scope, &t.Hits, &t.Misses, &t.LastSeen)
+			t.Scope = deckbox.Scope(scope)
 			return t, err
 		})
 	if err != nil {

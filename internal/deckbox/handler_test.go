@@ -24,19 +24,15 @@ type fakeStorage struct {
 	// Demand write is fire-and-forget, so tests need something to wait on.
 	searchRecorded chan struct{}
 
-	purgeResult PurgeResult
-	purgeErr    error
-
 	mu                    sync.Mutex // Search runs its queries concurrently
 	saveCardListCalls     int
+	outcomeCalls          int
 	UpdateTimestampCalled bool
 	lastSearchName        string
 	lastSearchExact       bool
-	lastSearchScope       string
+	lastSearchScope       Scope
 	lastOutcome           RefreshOutcome
 	recordedTerms         []TermStat
-	purgedLogin           string
-	unlinkedLogin         string
 }
 
 func (f *fakeStorage) RegisterUser(ctx context.Context, user BotUser) error        { return nil }
@@ -67,6 +63,7 @@ func (f *fakeStorage) GetDeckboxUser(ctx context.Context, login string) (*Deckbo
 func (f *fakeStorage) SaveRefreshOutcome(ctx context.Context, o RefreshOutcome) error {
 	f.mu.Lock()
 	f.lastOutcome = o
+	f.outcomeCalls++
 	// Only a successful refresh stamps updated_at; a failure records its error
 	// and leaves the timestamp alone.
 	first := o.UpdatedAt != nil && !f.UpdateTimestampCalled
@@ -96,25 +93,37 @@ func (f *fakeStorage) RecordSearch(ctx context.Context, terms []TermStat) error 
 	return nil
 }
 
-func (f *fakeStorage) PurgeDeckboxUser(ctx context.Context, login string) (PurgeResult, error) {
+// fakeAdmin is a configurable AdminStore. It is separate from fakeStorage
+// because the two interfaces are: a test of search or Refresh never has to
+// answer the Admin Panel's queries.
+type fakeAdmin struct {
+	purgeResult PurgeResult
+	purgeErr    error
+
+	mu            sync.Mutex
+	purgedLogin   string
+	unlinkedLogin string
+}
+
+func (f *fakeAdmin) PurgeDeckboxUser(ctx context.Context, login string) (PurgeResult, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.purgedLogin = login
 	return f.purgeResult, f.purgeErr
 }
 
-func (f *fakeStorage) UnlinkBotUser(ctx context.Context, login string) error {
+func (f *fakeAdmin) UnlinkBotUser(ctx context.Context, login string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.unlinkedLogin = login
 	return nil
 }
 
-func (f *fakeStorage) AdminOverview(ctx context.Context, staleThreshold int64) (Overview, error) {
+func (f *fakeAdmin) AdminOverview(ctx context.Context, staleThreshold int64) (Overview, error) {
 	return Overview{}, nil
 }
-func (f *fakeStorage) AdminUsers(ctx context.Context) ([]AdminUser, error) { return nil, nil }
-func (f *fakeStorage) AdminInsights(ctx context.Context) (Insights, error) { return Insights{}, nil }
+func (f *fakeAdmin) AdminUsers(ctx context.Context) ([]AdminUser, error) { return nil, nil }
+func (f *fakeAdmin) AdminInsights(ctx context.Context) (Insights, error) { return Insights{}, nil }
 
 func (f *fakeStorage) saveCalls() int {
 	f.mu.Lock()
@@ -128,9 +137,18 @@ func (f *fakeStorage) timestampCalled() bool {
 	return f.UpdateTimestampCalled
 }
 
+func (f *fakeStorage) outcomeRecorded() bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.outcomeCalls > 0
+}
+
 // fakeScraper is a configurable Fetcher for tests.
 type fakeScraper struct {
 	fetchErr error
+	// emptyLists makes every Card List come back with no cards, which is what a
+	// Deckbox User who has not filled in their collection actually looks like.
+	emptyLists bool
 }
 
 func (f *fakeScraper) FetchDeckboxUserProfile(ctx context.Context, login string) (DeckboxUser, error) {
@@ -145,11 +163,20 @@ func (f *fakeScraper) FetchCardList(ctx context.Context, listId int64) (CardList
 	if f.fetchErr != nil {
 		return CardList{}, f.fetchErr
 	}
+	if f.emptyLists {
+		return CardList{ListId: listId, Cards: map[string]int16{}}, nil
+	}
 	return CardList{ListId: listId, Cards: map[string]int16{"Card_1": 1}}, nil
 }
 
 func newTestDeckbox(storage DeckboxSaver, scraper Fetcher) *Deckbox {
-	return New(slog.Default(), storage, scraper, 3, 24)
+	return New(slog.Default(), storage, &fakeAdmin{}, scraper, 3, 24)
+}
+
+// newTestDeckboxAdmin builds one for the Admin Panel operations, where the
+// AdminStore is what the test configures and asserts on.
+func newTestDeckboxAdmin(admin *fakeAdmin) *Deckbox {
+	return New(slog.Default(), &fakeStorage{}, admin, &fakeScraper{}, 3, 24)
 }
 
 // listMatch builds one grouped storage result.
@@ -198,149 +225,107 @@ func (e *errorStorage) RegisterUser(ctx context.Context, user BotUser) error {
 	return errors.New("duplicate user")
 }
 
-// --- refreshUser ---
+// --- refreshUser: reports what happened, decides nothing ---
+//
+// The unchanged-list skip lives in storage — see
+// TestSaveCardListSkipsUnchangedBody in internal/storage/sqlite.
 
-func TestRefreshUserDoesNotUpdateTimestampOnSaveError(t *testing.T) {
-	storage := &fakeStorage{saveCardListErr: errors.New("save failed")}
-	d := newTestDeckbox(storage, &fakeScraper{})
-	cards, errStr := d.refreshUser(context.Background(), slog.Default(), "testuser")
-	if cards != 0 {
-		t.Fatalf("expected 0 cards, got %d", cards)
+func TestRefreshUserReportsWhatHappened(t *testing.T) {
+	tests := []struct {
+		name      string
+		storage   *fakeStorage
+		scraper   *fakeScraper
+		wantSaved bool
+		wantErr   bool
+		wantCards int
+	}{
+		{
+			name:    "profile fetch fails",
+			storage: &fakeStorage{}, scraper: &fakeScraper{fetchErr: errors.New("network error")},
+			wantSaved: false, wantErr: true, wantCards: 0,
+		},
+		{
+			name:    "card list cannot be saved",
+			storage: &fakeStorage{saveCardListErr: errors.New("disk full")}, scraper: &fakeScraper{},
+			wantSaved: true, wantErr: true, wantCards: 0,
+		},
+		{
+			name:    "collection is empty",
+			storage: &fakeStorage{}, scraper: &fakeScraper{emptyLists: true},
+			wantSaved: true, wantErr: false, wantCards: 0,
+		},
+		{
+			name:    "everything works",
+			storage: &fakeStorage{}, scraper: &fakeScraper{},
+			wantSaved: true, wantErr: false, wantCards: 1,
+		},
 	}
-	if errStr == "" {
-		t.Fatal("expected non-empty error string when save fails")
-	}
-	if storage.timestampCalled() {
-		t.Fatal("timestamp must not be updated when save fails")
-	}
-}
 
-func TestRefreshUserUpdatesTimestampOnSuccess(t *testing.T) {
-	storage := &fakeStorage{}
-	d := newTestDeckbox(storage, &fakeScraper{})
-	cards, errStr := d.refreshUser(context.Background(), slog.Default(), "testuser")
-	if errStr != "" {
-		t.Fatalf("unexpected error: %s", errStr)
-	}
-	if cards == 0 {
-		t.Fatal("expected non-zero card count on success")
-	}
-	if !storage.timestampCalled() {
-		t.Fatal("timestamp must be updated on success")
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			out := newTestDeckbox(tt.storage, tt.scraper).refreshUser(context.Background(), slog.Default(), "petya")
+
+			if out.ProfileSaved != tt.wantSaved {
+				t.Errorf("ProfileSaved = %v, want %v", out.ProfileSaved, tt.wantSaved)
+			}
+			if (out.Err != "") != tt.wantErr {
+				t.Errorf("Err = %q, wanted an error: %v", out.Err, tt.wantErr)
+			}
+			if out.CardCount != tt.wantCards {
+				t.Errorf("CardCount = %d, want %d", out.CardCount, tt.wantCards)
+			}
+			// refreshUser reports; refreshUsers stamps and stores.
+			if out.UpdatedAt != nil {
+				t.Error("refreshUser must not stamp updated_at")
+			}
+			if tt.storage.outcomeRecorded() {
+				t.Error("refreshUser must not record the outcome")
+			}
+		})
 	}
 }
 
 func TestRefreshUserContextCancelled(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	storage := &fakeStorage{}
-	d := newTestDeckbox(storage, &fakeScraper{})
-	cards, errStr := d.refreshUser(ctx, slog.Default(), "testuser")
-	if cards != 0 {
-		t.Fatalf("expected 0 cards when context cancelled, got %d", cards)
-	}
-	if errStr == "" {
-		t.Fatal("expected error string when context cancelled")
-	}
-	if storage.timestampCalled() {
-		t.Fatal("timestamp must not be updated when context is cancelled")
+
+	out := newTestDeckbox(&fakeStorage{}, &fakeScraper{}).refreshUser(ctx, slog.Default(), "petya")
+	if out.ProfileSaved || out.Err == "" {
+		t.Fatalf("a cancelled refresh must report failure, got %+v", out)
 	}
 }
 
-func TestRefreshUserProfileFetchError(t *testing.T) {
-	storage := &fakeStorage{}
-	d := newTestDeckbox(storage, &fakeScraper{fetchErr: errors.New("network error")})
-	cards, errStr := d.refreshUser(context.Background(), slog.Default(), "testuser")
-	if cards != 0 {
-		t.Fatalf("expected 0 cards on scraper error, got %d", cards)
-	}
-	if errStr == "" {
-		t.Fatal("expected error string when profile fetch fails")
-	}
-	if storage.timestampCalled() {
-		t.Fatal("timestamp must not be updated when scraper fails")
-	}
-}
+// --- refreshUsers: the one place an outcome is judged ---
 
-// --- saveCardListIfChanged ---
-
-func TestSaveCardListIfChangedSkipsUnchanged(t *testing.T) {
-	storage := &fakeStorage{}
-	d := newTestDeckbox(storage, &fakeScraper{})
-	ctx := context.Background()
-	list := CardList{ListId: 1, Cards: map[string]int16{"Bolt": 1}, BodyHash: 42}
-
-	if !d.saveCardListIfChanged(ctx, slog.Default(), list) {
-		t.Fatal("first save should succeed")
-	}
-	if storage.saveCalls() != 1 {
-		t.Fatalf("expected 1 save call, got %d", storage.saveCalls())
+func TestRefreshUsersStampsEverythingItCouldRead(t *testing.T) {
+	// An empty collection is a legitimate answer, not a failure. Refusing to
+	// stamp updated_at for one leaves that Deckbox User permanently stale, and
+	// the ticker re-scrapes them every 30 seconds forever.
+	tests := []struct {
+		name      string
+		storage   *fakeStorage
+		scraper   *fakeScraper
+		wantStamp bool
+	}{
+		{"full collection", &fakeStorage{}, &fakeScraper{}, true},
+		{"empty collection", &fakeStorage{}, &fakeScraper{emptyLists: true}, true},
+		{"lists could not be saved", &fakeStorage{saveCardListErr: errors.New("disk full")}, &fakeScraper{}, true},
+		{"profile unreachable", &fakeStorage{}, &fakeScraper{fetchErr: errors.New("network error")}, false},
 	}
 
-	// Same hash again: must skip the save but still report success.
-	if !d.saveCardListIfChanged(ctx, slog.Default(), list) {
-		t.Fatal("unchanged save should report success")
-	}
-	if storage.saveCalls() != 1 {
-		t.Fatalf("unchanged list must not be saved again, got %d calls", storage.saveCalls())
-	}
-
-	// Changed hash: must save again.
-	list.BodyHash = 43
-	if !d.saveCardListIfChanged(ctx, slog.Default(), list) {
-		t.Fatal("changed save should succeed")
-	}
-	if storage.saveCalls() != 2 {
-		t.Fatalf("changed list must be saved, got %d calls", storage.saveCalls())
-	}
-}
-
-func TestSaveCardListIfChangedIsPerInstance(t *testing.T) {
-	// The hash cache lives on the receiver, so a second Deckbox never inherits
-	// another's skip decisions.
-	list := CardList{ListId: 1, Cards: map[string]int16{"Bolt": 1}, BodyHash: 42}
-
-	storage1 := &fakeStorage{}
-	newTestDeckbox(storage1, &fakeScraper{}).saveCardListIfChanged(context.Background(), slog.Default(), list)
-
-	storage2 := &fakeStorage{}
-	newTestDeckbox(storage2, &fakeScraper{}).saveCardListIfChanged(context.Background(), slog.Default(), list)
-
-	if storage2.saveCalls() != 1 {
-		t.Fatalf("a fresh Deckbox must save the list, got %d calls", storage2.saveCalls())
-	}
-}
-
-func TestSaveCardListIfChangedZeroHashAlwaysSaves(t *testing.T) {
-	storage := &fakeStorage{}
-	d := newTestDeckbox(storage, &fakeScraper{})
-	ctx := context.Background()
-	list := CardList{ListId: 1, Cards: map[string]int16{"Bolt": 1}} // BodyHash 0
-
-	d.saveCardListIfChanged(ctx, slog.Default(), list)
-	d.saveCardListIfChanged(ctx, slog.Default(), list)
-	if storage.saveCalls() != 2 {
-		t.Fatalf("zero hash must never be skipped, got %d calls", storage.saveCalls())
-	}
-}
-
-func TestSaveCardListIfChangedFailedSaveNotCached(t *testing.T) {
-	storage := &fakeStorage{saveCardListErr: errors.New("disk full")}
-	d := newTestDeckbox(storage, &fakeScraper{})
-	ctx := context.Background()
-	list := CardList{ListId: 1, Cards: map[string]int16{"Bolt": 1}, BodyHash: 42}
-
-	if d.saveCardListIfChanged(ctx, slog.Default(), list) {
-		t.Fatal("failed save must report failure")
-	}
-
-	// After the failure the hash must not be cached: the retry must save again.
-	storage.saveCardListErr = nil
-	if !d.saveCardListIfChanged(ctx, slog.Default(), list) {
-		t.Fatal("retry save should succeed")
-	}
-	if storage.saveCalls() != 2 {
-		t.Fatalf("expected retry to hit storage, got %d calls", storage.saveCalls())
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			out := newTestDeckbox(tt.storage, tt.scraper).refreshUsers(context.Background(), []string{"petya"}, 1)
+			if len(out) != 1 {
+				t.Fatalf("expected one outcome, got %d", len(out))
+			}
+			if stamped := out[0].UpdatedAt != nil; stamped != tt.wantStamp {
+				t.Errorf("stamped = %v, want %v (outcome %+v)", stamped, tt.wantStamp, out[0])
+			}
+			if !tt.storage.outcomeRecorded() {
+				t.Error("every outcome must be recorded, successful or not")
+			}
+		})
 	}
 }
 

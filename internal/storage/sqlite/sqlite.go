@@ -1,7 +1,6 @@
 package sqlite
 
 import (
-	"FriendlyCardFinder/env"
 	"FriendlyCardFinder/internal/deckbox"
 	"FriendlyCardFinder/internal/lib/logger/sl"
 	"context"
@@ -85,7 +84,11 @@ func buildDSN(dataSourceName string) string {
 	return dataSourceName + sep + "_journal_mode=WAL&_synchronous=NORMAL&_busy_timeout=5000&_cache_size=-8000"
 }
 
-func New(dataSourceName string, log *slog.Logger) (*SQLiteStorage, error) {
+// New opens the storage. batchSize is the number of card rows per INSERT; zero
+// or less takes defaultCardBatchSize. It is an argument rather than an
+// environment read so the whole process is configured in one place, and so a
+// test or benchmark can vary it without touching the environment.
+func New(dataSourceName string, log *slog.Logger, batchSize int) (*SQLiteStorage, error) {
 	const op = "storage.sqlite.New"
 
 	dsn := buildDSN(dataSourceName)
@@ -120,12 +123,8 @@ func New(dataSourceName string, log *slog.Logger) (*SQLiteStorage, error) {
 	// on the SQLite build — we degrade gracefully if it is not supported.
 	ftsEnabled := ensureFtsTable(db, log)
 
-	// Read batch size from environment variable if set
-	batchSize := defaultCardBatchSize
-	if bsStr := env.CardListBatchSize.GetValue(); bsStr != "" {
-		if parsed, err := strconv.Atoi(bsStr); err == nil && parsed > 0 {
-			batchSize = parsed
-		}
+	if batchSize <= 0 {
+		batchSize = defaultCardBatchSize
 	}
 
 	return &SQLiteStorage{
@@ -303,6 +302,8 @@ func (s *SQLiteStorage) GetAllDeckboxUsersWithOldLists(ctx context.Context, thre
 	return logins, nil
 }
 
+// SaveCardList replaces a Card List's rows, skipping the write entirely when
+// the export it was parsed from is byte-identical to the one already stored.
 func (s *SQLiteStorage) SaveCardList(ctx context.Context, list deckbox.CardList) error {
 	const op = "storage.sqlite.SaveCardList"
 	log := s.log
@@ -318,6 +319,22 @@ func (s *SQLiteStorage) SaveCardList(ctx context.Context, list deckbox.CardList)
 	}
 	defer tx.Rollback()
 
+	// The unchanged-list skip reads and writes its hash in the same transaction
+	// as the rows the hash describes, so deleting a list deletes the hash with
+	// it and no caller has anything to invalidate. It also survives a restart,
+	// where an in-process cache would rewrite every list once at boot.
+	if list.BodyHash != 0 {
+		var stored int64
+		err := tx.QueryRowContext(ctx, `SELECT bodyHash FROM card_list_hashes WHERE listId = ?`, list.ListId).Scan(&stored)
+		switch {
+		case err == nil && stored == int64(list.BodyHash):
+			log.Debug("card list unchanged, skipping save", slog.String("operation", op), slog.Int64("list_id", list.ListId))
+			return nil
+		case err != nil && err != sql.ErrNoRows:
+			return fmt.Errorf("%s: read body hash: %w", op, err)
+		}
+	}
+
 	if _, err := tx.ExecContext(ctx, `DELETE FROM card_lists WHERE listId = ?`, list.ListId); err != nil {
 		return fmt.Errorf("%s: clear card_lists: %w", op, err)
 	}
@@ -327,6 +344,10 @@ func (s *SQLiteStorage) SaveCardList(ctx context.Context, list deckbox.CardList)
 		if _, err := tx.ExecContext(ctx, `DELETE FROM card_lists_fts WHERE card_lists_fts MATCH ?`, ftsListIdQuery(list.ListId)); err != nil {
 			return fmt.Errorf("%s: clear card_lists_fts: %w", op, err)
 		}
+	}
+
+	if err := storeBodyHash(ctx, tx, list); err != nil {
+		return fmt.Errorf("%s: store body hash: %w", op, err)
 	}
 
 	// An empty new list still needs the clear above committed.
@@ -380,6 +401,22 @@ func (s *SQLiteStorage) SaveCardList(ctx context.Context, list deckbox.CardList)
 	}
 
 	return nil
+}
+
+// storeBodyHash records the hash of the export the list was saved from, or
+// drops any stored hash when the hash is unknown (0) so a later save can never
+// be skipped against content the stored hash does not describe.
+func storeBodyHash(ctx context.Context, tx *sql.Tx, list deckbox.CardList) error {
+	if list.BodyHash == 0 {
+		_, err := tx.ExecContext(ctx, `DELETE FROM card_list_hashes WHERE listId = ?`, list.ListId)
+		return err
+	}
+	// SQLite integers are signed; the FNV-64a hash round-trips through int64
+	// unchanged, and only ever gets compared against itself.
+	_, err := tx.ExecContext(ctx, `
+	INSERT INTO card_list_hashes(listId, bodyHash) VALUES (?, ?)
+	ON CONFLICT(listId) DO UPDATE SET bodyHash = excluded.bodyHash`, list.ListId, int64(list.BodyHash))
+	return err
 }
 
 // SearchCard returns the Card Lists holding the queried card, each already

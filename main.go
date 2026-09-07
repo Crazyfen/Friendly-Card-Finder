@@ -4,19 +4,15 @@ import (
 	"FriendlyCardFinder/internal/admin"
 	"FriendlyCardFinder/internal/config"
 	"FriendlyCardFinder/internal/deckbox"
-	"FriendlyCardFinder/internal/i18n"
 	"FriendlyCardFinder/internal/lib/logger/sl"
 	"FriendlyCardFinder/internal/lib/tgutil"
 	"FriendlyCardFinder/internal/storage/sqlite"
 	"FriendlyCardFinder/internal/telegram"
 	"context"
-	"fmt"
 	"log/slog"
 	"os"
 	"os/signal"
 	"runtime"
-	"strconv"
-	"strings"
 	"time"
 
 	"net/http"
@@ -26,9 +22,12 @@ import (
 	"github.com/go-telegram/bot/models"
 )
 
+// App is the Telegram adapter: it maps updates to telegram.Requests and the
+// Replies that come back to SendMessage calls. It decides nothing a user can
+// see — that lives in telegram.Commands, where tests can reach it.
 type App struct {
 	log *slog.Logger
-	dbx *deckbox.Deckbox
+	cmd *telegram.Commands
 }
 
 const (
@@ -36,6 +35,9 @@ const (
 	envDev   = "dev"
 	envProd  = "prod"
 )
+
+// telegramMessageLimit is the largest message Telegram accepts, in bytes.
+const telegramMessageLimit = 4096
 
 func main() {
 	cfg := config.MustLoad()
@@ -60,7 +62,7 @@ func main() {
 		}()
 	}
 
-	storage, err := sqlite.New(cfg.StoragePath, log)
+	storage, err := sqlite.New(cfg.StoragePath, log, cfg.CardListBatchSize)
 	if err != nil {
 		log.Error("failed to initialize storage", sl.Err(err))
 		os.Exit(1)
@@ -78,21 +80,19 @@ func main() {
 		CookiePath:     cfg.DeckboxCookiePath,
 	})
 
-	app := &App{
-		log: log,
-		dbx: deckbox.New(log, storage, scraper, cfg.CardListRefreshHours, cfg.FreshnessTimeLimitHours),
-	}
+	dbx := deckbox.New(log, storage, storage, scraper, cfg.CardListRefreshHours, cfg.FreshnessTimeLimitHours)
+	app := &App{log: log, cmd: telegram.NewCommands(log, dbx)}
 
 	// Background refresh: runs immediately at startup then on a ticker so searches
 	// are never blocked waiting for stale lists to refresh.
 	go func() {
-		app.dbx.RefreshStale(ctx)
+		dbx.RefreshStale(ctx)
 		ticker := time.NewTicker(time.Duration(30) * time.Second)
 		defer ticker.Stop()
 		for {
 			select {
 			case <-ticker.C:
-				app.dbx.RefreshStale(ctx)
+				dbx.RefreshStale(ctx)
 			case <-ctx.Done():
 				return
 			}
@@ -101,7 +101,7 @@ func main() {
 
 	// Admin Panel. It refuses to start without a password rather than exposing a
 	// purge endpoint openly, so a missing ADMIN_PASSWORD disables it loudly.
-	if panel, err := admin.New(log, app.dbx, admin.Config{
+	if panel, err := admin.New(log, dbx, admin.Config{
 		Addr:     cfg.AdminAddr,
 		User:     cfg.AdminUser,
 		Password: cfg.AdminPassword,
@@ -116,7 +116,7 @@ func main() {
 	}
 
 	opts := []bot.Option{
-		bot.WithDefaultHandler(app.defaultHandler),
+		bot.WithDefaultHandler(app.handle("search", app.cmd.Search)),
 	}
 
 	b, err := bot.New(cfg.BotToken, opts...)
@@ -125,10 +125,10 @@ func main() {
 		os.Exit(1)
 	}
 
-	b.RegisterHandler(bot.HandlerTypeMessageText, "/start", bot.MatchTypeExact, app.startHandler)
-	b.RegisterHandler(bot.HandlerTypeMessageText, "sell", bot.MatchTypeCommandStartOnly, app.sellHandler)
-	b.RegisterHandler(bot.HandlerTypeMessageText, "deckbox", bot.MatchTypeCommandStartOnly, app.deckboxHandler)
-	b.RegisterHandler(bot.HandlerTypeMessageText, "suggestdeckbox", bot.MatchTypeCommandStartOnly, app.suggestdeckboxHandler)
+	b.RegisterHandler(bot.HandlerTypeMessageText, "/start", bot.MatchTypeExact, app.handle("start", app.cmd.Start))
+	b.RegisterHandler(bot.HandlerTypeMessageText, "sell", bot.MatchTypeCommandStartOnly, app.handle("sell", app.cmd.Sell))
+	b.RegisterHandler(bot.HandlerTypeMessageText, "deckbox", bot.MatchTypeCommandStartOnly, app.handle("deckbox", app.cmd.Register))
+	b.RegisterHandler(bot.HandlerTypeMessageText, "suggestdeckbox", bot.MatchTypeCommandStartOnly, app.suggestHandler)
 
 	log.Info("starting bot")
 	b.Start(ctx)
@@ -143,193 +143,68 @@ func setupLogger(env string) *slog.Logger {
 	}
 }
 
-func (a *App) defaultHandler(ctx context.Context, b *bot.Bot, update *models.Update) {
-	const op = "handlers.defaultHandler"
-	log := a.log.With(slog.String("operation", op), slog.String("message_id", strconv.Itoa(update.Message.ID)))
-	log.Info("handling default message")
-
-	lang := i18n.DetectLang(update.Message.From.LanguageCode)
-	a.searchAndReply(ctx, b, log, lang, update.Message.Text, update.Message.Chat.ID, int(update.Message.ID), deckbox.ScopeTradelist)
-}
-
-func (a *App) startHandler(ctx context.Context, b *bot.Bot, update *models.Update) {
-	const op = "handlers.startHandler"
-	log := a.log.With(slog.String("operation", op), slog.String("message_id", strconv.Itoa(update.Message.ID)))
-	log.Info("handling /start command")
-
-	lang := i18n.DetectLang(update.Message.From.LanguageCode)
-	log.With(slog.String("LanguageCode", update.Message.From.LanguageCode), slog.String("detected_lang", lang)).Debug("detected user language")
-
-	_, err := b.SendMessage(ctx, &bot.SendMessageParams{
-		ChatID:    update.Message.Chat.ID,
-		Text:      i18n.T(lang, "start.welcome"),
-		ParseMode: models.ParseModeHTML,
-	})
-	if err != nil {
-		log.Error("failed to send /start response", sl.Err(err))
-	}
-}
-
-func (a *App) deckboxHandler(ctx context.Context, b *bot.Bot, update *models.Update) {
-	const op = "handlers.deckboxHandler"
-	log := a.log.With(slog.String("operation", op), slog.String("message_id", strconv.Itoa(update.Message.ID)))
-	log.Info("handling /deckbox command")
-
-	lang := i18n.DetectLang(update.Message.From.LanguageCode)
-	response := a.register(ctx, log, update.Message, lang)
-
-	_, err := b.SendMessage(ctx, &bot.SendMessageParams{
-		ChatID: update.Message.Chat.ID,
-		Text:   response,
-	})
-	if err != nil {
-		log.Error("failed to send /deckbox response", sl.Err(err))
-	}
-}
-
-// register turns a /deckbox message into a Registration and reports the outcome
-// in the user's language.
-func (a *App) register(ctx context.Context, log *slog.Logger, message *models.Message, lang string) string {
-	login := telegram.CommandArgument(message)
-	if login == "" {
-		log.Info("forgotten deckbox login")
-		return i18n.T(lang, "deckbox.register_no_argument")
-	}
-
-	err := a.dbx.Register(ctx, deckbox.Registration{
-		TelegramID:       message.From.ID,
-		TelegramUsername: message.From.Username,
-		DeckboxLogin:     login,
-	})
-	if err != nil {
-		return i18n.T(lang, "deckbox.register_error")
-	}
-
-	return fmt.Sprintf(i18n.T(lang, "deckbox.register_success"), message.From.FirstName, message.From.LastName)
-}
-
-func (a *App) suggestdeckboxHandler(ctx context.Context, b *bot.Bot, update *models.Update) {
-	const op = "handlers.suggestdeckboxHandler"
-	log := a.log.With(slog.String("operation", op), slog.String("message_id", strconv.Itoa(update.Message.ID)))
-	log.Info("handling /suggestdeckbox command")
-
-	argument := telegram.CommandArgument(update.Message)
-	lang := i18n.DetectLang(update.Message.From.LanguageCode)
-	if argument == "" {
-		_, err := b.SendMessage(ctx, &bot.SendMessageParams{
-			ChatID: update.Message.Chat.ID,
-			Text:   i18n.T(lang, "suggest.no_argument"),
-		})
-		if err != nil {
-			log.Error("failed to send response", sl.Err(err))
-		}
-		return
-	}
-
-	logins := strings.Split(argument, "\n")
-
-	go func() {
-		result := a.dbx.Suggest(ctx, logins)
-
-		var response strings.Builder
-		response.WriteString(fmt.Sprintf(i18n.T(lang, "suggest.summary"),
-			result.ProcessedCount, result.SkippedCount))
-
-		if len(result.Errors) > 0 {
-			response.WriteString("\n\n")
-			response.WriteString(i18n.T(lang, "suggest.errors_header"))
-			for _, err := range result.Errors {
-				response.WriteString(fmt.Sprintf("• %s\n", err))
-			}
-		}
-
-		_, err := b.SendMessage(ctx, &bot.SendMessageParams{
-			ChatID: update.Message.Chat.ID,
-			Text:   response.String(),
-			ReplyParameters: &models.ReplyParameters{
-				MessageID: int(update.Message.ID),
-			},
-		})
-		if err != nil {
-			log.Error("failed to send suggest response", sl.Err(err))
-		}
-	}()
-
-	_, err := b.SendMessage(ctx, &bot.SendMessageParams{
-		ChatID: update.Message.Chat.ID,
-		Text:   fmt.Sprintf(i18n.T(lang, "suggest.ack"), len(logins)),
-	})
-	if err != nil {
-		log.Error("failed to send acknowledgement", sl.Err(err))
-	}
-}
-
-func (a *App) sellHandler(ctx context.Context, b *bot.Bot, update *models.Update) {
-	const op = "handlers.sellHandler"
-	log := a.log.With(slog.String("operation", op), slog.String("message_id", strconv.Itoa(update.Message.ID)))
-	log.Info("handling /sell command")
-
-	argument := telegram.CommandArgument(update.Message)
-	lang := i18n.DetectLang(update.Message.From.LanguageCode)
-	if argument == "" {
-		_, err := b.SendMessage(ctx, &bot.SendMessageParams{
-			ChatID: update.Message.Chat.ID,
-			Text:   i18n.T(lang, "sell.no_argument"),
-		})
-		if err != nil {
-			log.Error("failed to send response", sl.Err(err))
-		}
-		return
-	}
-
-	a.searchAndReply(ctx, b, log, lang, argument, update.Message.Chat.ID, int(update.Message.ID), deckbox.ScopeWishlist)
-}
-
-// searchAndReply parses one-card-per-line input, searches, and sends the
-// rendered result (plus a not-found message when one is produced).
-func (a *App) searchAndReply(ctx context.Context, b *bot.Bot, log *slog.Logger, lang, text string, chatID int64, replyToID int, scope string) {
-	var cards []string
-	for line := range strings.SplitSeq(text, "\n") {
-		line = strings.TrimSpace(line)
-		if line != "" {
-			cards = append(cards, line)
-		}
-	}
-	if len(cards) == 0 {
-		return
-	}
-
-	result, err := a.dbx.Search(ctx, cards, scope)
-	if err != nil {
-		log.Error("failed to search cards", sl.Err(err))
-		return
-	}
-
-	mainMsg, notFoundMsg := telegram.RenderSearch(result, lang, scope)
-	sendHTMLReply(ctx, b, chatID, replyToID, mainMsg, log)
-	if notFoundMsg != "" {
-		sendHTMLReply(ctx, b, chatID, replyToID, notFoundMsg, log)
-	}
-}
-
-// sendHTMLReply sends an HTML-formatted message, splitting it into chained reply
-// parts if it exceeds Telegram's 4096-byte limit.
-func sendHTMLReply(ctx context.Context, b *bot.Bot, chatID int64, replyToID int, message string, log *slog.Logger) {
-	parts := tgutil.SplitMessage(message, 4096)
-	replyTo := replyToID
-	for _, p := range parts {
-		reply, err := b.SendMessage(ctx, &bot.SendMessageParams{
-			ChatID:    chatID,
-			Text:      p,
-			ParseMode: models.ParseModeHTML,
-			ReplyParameters: &models.ReplyParameters{
-				MessageID: replyTo,
-			},
-		})
-		if err != nil {
-			log.Error("failed to send response", sl.Err(err))
+// handle adapts one command to the Telegram SDK. Every command goes through it,
+// so the send-and-log-error path is written once.
+func (a *App) handle(name string, cmd func(context.Context, telegram.Request) []telegram.Reply) bot.HandlerFunc {
+	return func(ctx context.Context, b *bot.Bot, update *models.Update) {
+		if update.Message == nil {
 			return
 		}
-		replyTo = int(reply.ID)
+		log := a.log.With(slog.String("operation", "handlers."+name), slog.Int("message_id", update.Message.ID))
+		log.Info("handling message")
+
+		req := telegram.NewRequest(update.Message)
+		a.send(ctx, b, log, req, cmd(ctx, req)...)
+	}
+}
+
+// suggestHandler is the one command that answers twice: an acknowledgement now,
+// and the summary when the bulk Refresh finishes.
+func (a *App) suggestHandler(ctx context.Context, b *bot.Bot, update *models.Update) {
+	if update.Message == nil {
+		return
+	}
+	log := a.log.With(slog.String("operation", "handlers.suggestdeckbox"), slog.Int("message_id", update.Message.ID))
+	log.Info("handling message")
+
+	req := telegram.NewRequest(update.Message)
+	ack, run := a.cmd.Suggest(req)
+	a.send(ctx, b, log, req, ack)
+	if run == nil {
+		return
+	}
+
+	go a.send(ctx, b, log, req, run(ctx))
+}
+
+// send delivers replies in order, splitting any that exceed Telegram's message
+// limit and chaining the parts so a long answer reads as one thread.
+func (a *App) send(ctx context.Context, b *bot.Bot, log *slog.Logger, req telegram.Request, replies ...telegram.Reply) {
+	for _, r := range replies {
+		if r.Text == "" {
+			continue
+		}
+
+		replyTo := 0
+		if r.ReplyTo {
+			replyTo = req.MessageID
+		}
+
+		for _, part := range tgutil.SplitMessage(r.Text, telegramMessageLimit) {
+			params := &bot.SendMessageParams{ChatID: req.ChatID, Text: part}
+			if r.HTML {
+				params.ParseMode = models.ParseModeHTML
+			}
+			if replyTo != 0 {
+				params.ReplyParameters = &models.ReplyParameters{MessageID: replyTo}
+			}
+
+			sent, err := b.SendMessage(ctx, params)
+			if err != nil {
+				log.Error("failed to send response", sl.Err(err))
+				break
+			}
+			replyTo = int(sent.ID)
+		}
 	}
 }

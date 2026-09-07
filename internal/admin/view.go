@@ -49,7 +49,7 @@ type manageView struct {
 
 type demandRow struct {
 	Term   string
-	Scope  string
+	Scope  deckbox.Scope
 	Hits   int
 	Misses int
 	Last   string

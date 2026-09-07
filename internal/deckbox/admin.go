@@ -2,6 +2,7 @@ package deckbox
 
 import (
 	"FriendlyCardFinder/internal/lib/logger/sl"
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
@@ -14,7 +15,7 @@ import (
 // exactly as ParseQuery produced it.
 type TermStat struct {
 	Term  string
-	Scope string
+	Scope Scope
 	Hit   bool
 }
 
@@ -28,16 +29,22 @@ type ListSize struct {
 // RefreshOutcome is what one Refresh attempt produced. UpdatedAt is nil when the
 // refresh failed, which leaves the previous timestamp in place so the Deckbox
 // User stays stale and gets retried.
+//
+// ProfileSaved is the difference between "we read this Deckbox User" and "we
+// could not reach them at all", and it is what decides whether updated_at gets
+// stamped. Err can be non-empty either way: a Card List that failed to fetch is
+// worth recording for the Admin Panel but is not a reason to call the whole
+// Refresh a failure.
 type RefreshOutcome struct {
 	DeckboxLogin string
 	CardCount    int
 	Err          string
+	ProfileSaved bool
 	UpdatedAt    *int64
 	Lists        []ListSize
 }
 
-// PurgeResult reports what a Purge removed. ListIDs is what the caller needs to
-// drop the matching BodyHash cache entries.
+// PurgeResult reports what a Purge removed.
 type PurgeResult struct {
 	ListIDs      []int64
 	CardRows     int64
@@ -81,7 +88,7 @@ type Overview struct {
 // TermDemand is one Search Term's counters.
 type TermDemand struct {
 	Term     string
-	Scope    string
+	Scope    Scope
 	Hits     int
 	Misses   int
 	LastSeen int64
@@ -129,22 +136,17 @@ type Insights struct {
 // Deckbox User.
 var ErrUnknownLogin = errors.New("unknown deckbox login")
 
-// Purge removes a Deckbox User and everything about them, then forgets the
-// BodyHash of the Card Lists that went with them. Skipping that last step would
-// leave saveCardListIfChanged convinced the (now deleted) lists are already
-// saved, so a re-registration of the same login would stay permanently empty.
+// Purge removes a Deckbox User and everything about them. The unchanged-list
+// skip is stored alongside the rows it describes, so the deletion takes it too
+// and a re-registration of the same login refills normally.
 func (d *Deckbox) Purge(ctx context.Context, login string) (PurgeResult, error) {
 	const op = "deckbox.Purge"
 	log := d.log.With(slog.String("operation", op), slog.String("deckbox_id", login))
 
-	res, err := d.storage.PurgeDeckboxUser(ctx, login)
+	res, err := d.admin.PurgeDeckboxUser(ctx, login)
 	if err != nil {
 		log.Error("failed to purge deckbox user", sl.Err(err))
 		return PurgeResult{}, err
-	}
-
-	for _, id := range res.ListIDs {
-		d.savedHashes.Delete(id)
 	}
 
 	log.Info("purged deckbox user",
@@ -186,7 +188,7 @@ func (d *Deckbox) Unlink(ctx context.Context, login string) error {
 	const op = "deckbox.Unlink"
 	log := d.log.With(slog.String("operation", op), slog.String("deckbox_id", login))
 
-	if err := d.storage.UnlinkBotUser(ctx, login); err != nil {
+	if err := d.admin.UnlinkBotUser(ctx, login); err != nil {
 		log.Error("failed to unlink registration", sl.Err(err))
 		return err
 	}
@@ -204,26 +206,27 @@ func (d *Deckbox) RefreshNow(ctx context.Context, login string) error {
 	if len(results) == 0 {
 		return fmt.Errorf("%s: no result for %s", op, login)
 	}
-	if results[0].err != "" {
-		return errors.New(results[0].err)
+	// A Card List problem is reported in the users table, not as a failed
+	// action: the Deckbox User was read and stored either way.
+	if !results[0].ProfileSaved {
+		return errors.New(cmp.Or(results[0].Err, "refresh did not complete"))
 	}
 	return nil
 }
 
 // AdminOverview, AdminUsers and AdminInsights exist so the Admin Panel reads
-// through the domain rather than reaching into storage — the same seam that
-// keeps the BodyHash cache correct for Purge.
+// through the domain rather than reaching into storage.
 func (d *Deckbox) AdminOverview(ctx context.Context) (Overview, error) {
 	// The staleness threshold is the same refresh window the ticker uses, so the
 	// panel's "stale" count means exactly what the bot means by it.
 	threshold := time.Now().Add(-time.Duration(d.refreshHours) * time.Hour).Unix()
-	return d.storage.AdminOverview(ctx, threshold)
+	return d.admin.AdminOverview(ctx, threshold)
 }
 
 func (d *Deckbox) AdminUsers(ctx context.Context) ([]AdminUser, error) {
-	return d.storage.AdminUsers(ctx)
+	return d.admin.AdminUsers(ctx)
 }
 
 func (d *Deckbox) AdminInsights(ctx context.Context) (Insights, error) {
-	return d.storage.AdminInsights(ctx)
+	return d.admin.AdminInsights(ctx)
 }

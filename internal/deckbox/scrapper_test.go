@@ -51,7 +51,7 @@ func TestCardListScrapper(t *testing.T) {
 	cardList, _ := scraper.FetchCardList(ctx, 3191615)
 
 	t.Run("known first card", func(t *testing.T) {
-		got, _ := cardList.GetCardQuantity("\"Brims\" Barone, Midway Mobster")
+		got := cardList.Cards["\"Brims\" Barone, Midway Mobster"]
 		expected := int16(1)
 
 		if got != expected {
@@ -60,7 +60,7 @@ func TestCardListScrapper(t *testing.T) {
 	})
 
 	t.Run("known last card", func(t *testing.T) {
-		got, _ := cardList.GetCardQuantity("Zurgo's Vanguard")
+		got := cardList.Cards["Zurgo's Vanguard"]
 		expected := int16(3)
 
 		if got != expected {
@@ -69,9 +69,8 @@ func TestCardListScrapper(t *testing.T) {
 	})
 
 	t.Run("unknown card", func(t *testing.T) {
-		_, err := cardList.GetCardQuantity("Some Unknown Card")
-		if err == nil {
-			t.Fatal("expected an error, got none")
+		if _, ok := cardList.Cards["Some Unknown Card"]; ok {
+			t.Fatal("expected the card to be absent")
 		}
 	})
 }

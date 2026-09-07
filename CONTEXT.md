@@ -8,13 +8,23 @@ The names this project uses for its own concepts. Architecture and conventions l
 
 **Card List** — one of a Deckbox User's three lists (inventory, tradelist, wishlist), identified by its Deckbox `listId`. Holds card name → quantity. `BodyHash` is the hash of the export it was parsed from, used to skip unchanged saves.
 
-**Scope** — which of the three Card Lists a search runs against: `tradelist` (plain text search), `wishlist` (`/sell`), or `inventory`.
+**Quantity** — how many copies of a card name a Card List holds, summed across every printing of it. The export page carries no variation data (set, printing, foil), so a name appearing on several lines is the same card in different variations and the lines are added together. This is deliberate: the quantities are not duplicates to be de-duplicated, and there is no per-variation number to recover.
+
+**Scope** — which of the three Card Lists a search runs against: `tradelist` (plain text search), `wishlist` (`/sell`), or `inventory`. A named type, not a bare string, because both the storage column and the Telegram wording default to the tradelist when they do not recognise the value.
+
+**Command** — one thing a Bot User can ask for, as a method on `telegram.Commands` taking a Request and returning Replies. The Command owns the wording, the missing-argument case and the Scope; `main.go` owns only the Telegram SDK calls that carry them.
+
+**Request** — one incoming message reduced to what a Command needs: the text with any command prefix stripped, the detected language, and who sent it from where.
+
+**Reply** — one message to send back, and whether it is HTML and whether it quotes the message that triggered it. A Command returns these rather than sending, which is what makes every Command reachable from a test.
 
 **Query** — one parsed search line: the card name with quotes stripped, whether the user asked for an exact match, and the Scope. Built by `ParseQuery`.
 
 **Exact match** — a query the user wrapped in quotes. Equality ignores case, accents and punctuation: `"vitu ghazi"` matches *Vitu-Ghazi, the City-Tree*. Without quotes, search is prefix-based per token.
 
-**Refresh** — re-scraping a Deckbox User's profile and all three Card Lists, then stamping `updated_at`. There is exactly one implementation (`Deckbox.refreshUser`); registration, the background ticker and `/suggestdeckbox` all go through it.
+**Session** — the Deckbox `_tcg_session` cookie the scraper authenticates with, and the rules around it: where it may come from, when it is replaced, and that one rejection causes one login however many workers noticed it.
+
+**Refresh** — re-scraping a Deckbox User's profile and all three Card Lists, then stamping `updated_at`. There is exactly one implementation (`Deckbox.refreshUser`); registration, the background ticker and `/suggestdeckbox` all go through it. A Refresh succeeds when the profile was read and stored — an empty collection is a legitimate answer, not a failure. Only a Deckbox User who could not be read at all stays stale.
 
 **Suggest** — the `/suggestdeckbox` bulk Refresh, which skips any Deckbox User whose data is still fresh.
 

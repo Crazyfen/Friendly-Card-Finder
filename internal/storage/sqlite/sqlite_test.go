@@ -17,7 +17,7 @@ import (
 func newTestDB(t *testing.T) *SQLiteStorage {
 	t.Helper()
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
-	s, err := New(t.TempDir()+"/test.db", log)
+	s, err := New(t.TempDir()+"/test.db", log, defaultCardBatchSize)
 	if err != nil {
 		t.Fatalf("failed to create test storage: %v", err)
 	}
@@ -28,7 +28,7 @@ func newTestDB(t *testing.T) *SQLiteStorage {
 // searchCards runs one search and flattens the grouped results into a single
 // cardName -> quantity map, so tests can assert on matched cards rather than on
 // the Card List groups SearchCard returns.
-func searchCards(t testing.TB, s *SQLiteStorage, ctx context.Context, name, scope string, exact bool) map[string]int16 {
+func searchCards(t testing.TB, s *SQLiteStorage, ctx context.Context, name string, scope deckbox.Scope, exact bool) map[string]int16 {
 	t.Helper()
 	results, err := s.SearchCard(ctx, deckbox.Query{Name: name, Scope: scope, Exact: exact})
 	if err != nil {
@@ -72,7 +72,7 @@ func TestFtsSchemaUpgrade(t *testing.T) {
 	dbFile := t.TempDir() + "/test.db"
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 
-	s, err := New(dbFile, log)
+	s, err := New(dbFile, log, defaultCardBatchSize)
 	if err != nil {
 		t.Fatalf("failed to create storage: %v", err)
 	}
@@ -104,7 +104,7 @@ func TestFtsSchemaUpgrade(t *testing.T) {
 	}
 
 	// Reopen: ensureFtsTable must detect the old schema and rebuild.
-	s2, err := New(dbFile, log)
+	s2, err := New(dbFile, log, defaultCardBatchSize)
 	if err != nil {
 		t.Fatalf("failed to reopen storage: %v", err)
 	}
@@ -129,7 +129,7 @@ func TestFtsSchemaUpgrade(t *testing.T) {
 func TestSaveCardListWithLargeCollection(t *testing.T) {
 	// Create a temporary database for testing
 	dbFile := t.TempDir() + "/test.db"
-	storage, err := New(dbFile, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	storage, err := New(dbFile, slog.New(slog.NewTextHandler(io.Discard, nil)), defaultCardBatchSize)
 	if err != nil {
 		t.Fatalf("failed to create storage: %v", err)
 	}
@@ -200,7 +200,7 @@ func TestSaveCardListBatching(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			dbFile := t.TempDir() + "/test.db"
-			storage, err := New(dbFile, slog.New(slog.NewTextHandler(io.Discard, nil)))
+			storage, err := New(dbFile, slog.New(slog.NewTextHandler(io.Discard, nil)), defaultCardBatchSize)
 			if err != nil {
 				t.Fatalf("failed to create storage: %v", err)
 			}
@@ -257,7 +257,7 @@ func TestSaveCardListBatching(t *testing.T) {
 func TestSaveCardListTransactionRollback(t *testing.T) {
 	// Test that transaction rolls back on error
 	dbFile := t.TempDir() + "/test.db"
-	storage, err := New(dbFile, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	storage, err := New(dbFile, slog.New(slog.NewTextHandler(io.Discard, nil)), defaultCardBatchSize)
 	if err != nil {
 		t.Fatalf("failed to create storage: %v", err)
 	}
@@ -325,10 +325,125 @@ func TestSaveCardListTransactionRollback(t *testing.T) {
 	}
 }
 
+// seedTradelist points a Deckbox User's tradelist at listID so saved cards are
+// reachable through SearchCard.
+func seedTradelist(t *testing.T, s *SQLiteStorage, login string, listID int64) {
+	t.Helper()
+	if err := s.SaveDeckboxUser(context.Background(), deckbox.DeckboxUser{
+		DeckboxLogin: login,
+		TradelistID:  &listID,
+	}); err != nil {
+		t.Fatalf("save deckbox user: %v", err)
+	}
+}
+
+func TestSaveCardListSkipsUnchangedBody(t *testing.T) {
+	// The skip compares the export's hash against the one stored with the rows,
+	// so passing different cards under an unchanged hash must leave the stored
+	// list untouched — that is what proves no write happened.
+	ctx := context.Background()
+	s := newTestDB(t)
+
+	const listID = int64(501)
+	seedTradelist(t, s, "petya", listID)
+
+	save := func(hash uint64, card string) {
+		t.Helper()
+		if err := s.SaveCardList(ctx, deckbox.CardList{
+			ListId:   listID,
+			Cards:    map[string]int16{card: 1},
+			BodyHash: hash,
+		}); err != nil {
+			t.Fatalf("save card list: %v", err)
+		}
+	}
+	held := func(card string) bool {
+		t.Helper()
+		return len(searchCards(t, s, ctx, card, deckbox.ScopeTradelist, false)) == 1
+	}
+
+	save(42, "Alpha")
+	if !held("Alpha") {
+		t.Fatal("first save did not store the list")
+	}
+
+	save(42, "Beta")
+	if held("Beta") {
+		t.Error("an unchanged body hash must skip the write")
+	}
+	if !held("Alpha") {
+		t.Error("a skipped save must leave the stored list intact")
+	}
+
+	save(43, "Gamma")
+	if !held("Gamma") {
+		t.Error("a changed body hash must rewrite the list")
+	}
+	if held("Alpha") {
+		t.Error("the rewrite did not clear the previous rows")
+	}
+
+	// An unknown hash (0) can never be skipped against, in either direction.
+	save(0, "Delta")
+	if !held("Delta") {
+		t.Error("a list with no body hash must always be written")
+	}
+	save(0, "Epsilon")
+	if !held("Epsilon") {
+		t.Error("a list with no body hash must always be written")
+	}
+}
+
+func TestSaveCardListSkipSurvivesRestart(t *testing.T) {
+	// The skip is stored, not cached in the process. A restart that forgot it
+	// would rewrite every Card List once at boot, on the single write connection.
+	ctx := context.Background()
+	dbFile := t.TempDir() + "/test.db"
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	const listID = int64(502)
+
+	first, err := New(dbFile, log, defaultCardBatchSize)
+	if err != nil {
+		t.Fatalf("failed to create storage: %v", err)
+	}
+	seedTradelist(t, first, "petya", listID)
+	if err := first.SaveCardList(ctx, deckbox.CardList{
+		ListId:   listID,
+		Cards:    map[string]int16{"Alpha": 1},
+		BodyHash: 42,
+	}); err != nil {
+		t.Fatalf("save card list: %v", err)
+	}
+	if err := first.Close(); err != nil {
+		t.Fatalf("close storage: %v", err)
+	}
+
+	second, err := New(dbFile, log, defaultCardBatchSize)
+	if err != nil {
+		t.Fatalf("failed to reopen storage: %v", err)
+	}
+	t.Cleanup(func() { second.Close() })
+
+	if err := second.SaveCardList(ctx, deckbox.CardList{
+		ListId:   listID,
+		Cards:    map[string]int16{"Beta": 1},
+		BodyHash: 42,
+	}); err != nil {
+		t.Fatalf("save card list after reopen: %v", err)
+	}
+
+	if len(searchCards(t, second, ctx, "Beta", deckbox.ScopeTradelist, false)) != 0 {
+		t.Error("a restart must not rewrite an unchanged Card List")
+	}
+	if len(searchCards(t, second, ctx, "Alpha", deckbox.ScopeTradelist, false)) != 1 {
+		t.Error("the stored list did not survive the restart")
+	}
+}
+
 func TestSearchCardWithFTS(t *testing.T) {
 	// Ensure FTS is available in this environment
 	dbFile := t.TempDir() + "/test.db"
-	storage, err := New(dbFile, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	storage, err := New(dbFile, slog.New(slog.NewTextHandler(io.Discard, nil)), defaultCardBatchSize)
 	if err != nil {
 		t.Fatalf("failed to create storage: %v", err)
 	}
@@ -574,7 +689,7 @@ func TestSearchCardExact(t *testing.T) {
 
 func TestSearchCardWishlist(t *testing.T) {
 	dbFile := t.TempDir() + "/test.db"
-	storage, err := New(dbFile, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	storage, err := New(dbFile, slog.New(slog.NewTextHandler(io.Discard, nil)), defaultCardBatchSize)
 	if err != nil {
 		t.Fatalf("failed to create storage: %v", err)
 	}
@@ -818,7 +933,7 @@ func BenchmarkSaveCardList(b *testing.B) {
 
 	// Setup once; benchmark SaveCardList performance.
 	dbFile := b.TempDir() + "/bench.db"
-	storage, err := New(dbFile, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	storage, err := New(dbFile, slog.New(slog.NewTextHandler(io.Discard, nil)), defaultCardBatchSize)
 	if err != nil {
 		b.Fatalf("failed to create storage: %v", err)
 	}
@@ -860,7 +975,7 @@ func benchmarkSearchCard(b *testing.B, wantFTS bool) {
 
 	// Setup once; benchmark SearchCard performance.
 	dbFile := b.TempDir() + "/bench.db"
-	storage, err := New(dbFile, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	storage, err := New(dbFile, slog.New(slog.NewTextHandler(io.Discard, nil)), defaultCardBatchSize)
 	if err != nil {
 		b.Fatalf("failed to create storage: %v", err)
 	}
@@ -918,7 +1033,7 @@ func BenchmarkSaveCardList_PopulatedDB(b *testing.B) {
 	slog.SetDefault(slog.New(slog.NewTextHandler(io.Discard, nil)))
 	defer slog.SetDefault(oldLogger)
 
-	storage, err := New(b.TempDir()+"/bench.db", slog.New(slog.NewTextHandler(io.Discard, nil)))
+	storage, err := New(b.TempDir()+"/bench.db", slog.New(slog.NewTextHandler(io.Discard, nil)), defaultCardBatchSize)
 	if err != nil {
 		b.Fatalf("failed to create storage: %v", err)
 	}
@@ -969,12 +1084,11 @@ func BenchmarkSaveCardList_BatchSizes(b *testing.B) {
 
 	for _, batchSize := range []int{100, 500, 1000, 5000} {
 		b.Run(fmt.Sprintf("batch=%d", batchSize), func(b *testing.B) {
-			storage, err := New(b.TempDir()+"/bench.db", slog.New(slog.NewTextHandler(io.Discard, nil)))
+			storage, err := New(b.TempDir()+"/bench.db", slog.New(slog.NewTextHandler(io.Discard, nil)), batchSize)
 			if err != nil {
 				b.Fatalf("failed to create storage: %v", err)
 			}
 			defer storage.Close()
-			storage.batchSize = batchSize
 
 			tradelistID := int64(12345)
 			if err := storage.SaveDeckboxUser(ctx, deckbox.DeckboxUser{

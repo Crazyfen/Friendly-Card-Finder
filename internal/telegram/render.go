@@ -1,7 +1,7 @@
-// Package telegram renders Deckbox search results as Telegram HTML messages and
-// extracts command arguments from Telegram updates. Everything that knows about
-// Telegram markup or user-facing wording lives here, so the deckbox module deals
-// only in domain values.
+// Package telegram turns Telegram messages into replies: the commands in
+// command.go decide what to say, and the renderers here decide how a search
+// result looks. Everything that knows about Telegram markup or user-facing
+// wording lives here, so the deckbox module deals only in domain values.
 package telegram
 
 import (
@@ -11,8 +11,6 @@ import (
 	"fmt"
 	"sort"
 	"strings"
-
-	"github.com/go-telegram/bot/models"
 )
 
 // messageKeys are the i18n keys for one search scope. Tradelist and wishlist
@@ -25,7 +23,7 @@ type messageKeys struct {
 	multiNotFound  string
 }
 
-func keysFor(scope string) messageKeys {
+func keysFor(scope deckbox.Scope) messageKeys {
 	if scope == deckbox.ScopeWishlist {
 		return messageKeys{
 			noResults:      "sell.no_results",
@@ -47,7 +45,7 @@ func keysFor(scope string) messageKeys {
 // RenderSearch returns (mainMessage, notFoundMessage). The second string is
 // empty when every queried card was found at least once, and for a single-card
 // search, where the main message already says so.
-func RenderSearch(r deckbox.SearchResult, lang, scope string) (string, string) {
+func RenderSearch(r deckbox.SearchResult, lang string, scope deckbox.Scope) (string, string) {
 	if len(r.SearchQueries) == 1 {
 		return renderSingle(r, lang, scope), ""
 	}
@@ -56,7 +54,7 @@ func RenderSearch(r deckbox.SearchResult, lang, scope string) (string, string) {
 
 // renderSingle lists every matching card per owner, with a Deckbox link
 // pre-filtered to the query.
-func renderSingle(r deckbox.SearchResult, lang, scope string) string {
+func renderSingle(r deckbox.SearchResult, lang string, scope deckbox.Scope) string {
 	keys := keysFor(scope)
 	query := r.SearchQueries[0]
 
@@ -85,7 +83,7 @@ func renderSingle(r deckbox.SearchResult, lang, scope string) string {
 
 // renderMulti groups by owner and ranks them by how much of the requested set
 // they hold, so the best trade partner comes first.
-func renderMulti(r deckbox.SearchResult, lang, scope string) (string, string) {
+func renderMulti(r deckbox.SearchResult, lang string, scope deckbox.Scope) (string, string) {
 	keys := keysFor(scope)
 	totalQueried := len(r.SearchQueries)
 
@@ -133,20 +131,3 @@ func sortedCardNames(cards map[string]int16) []string {
 	return names
 }
 
-// CommandArgument extracts the argument text following a bot command.
-func CommandArgument(m *models.Message) string {
-	if len(m.Entities) == 0 {
-		return ""
-	}
-	entity := m.Entities[0]
-
-	if entity.Type != models.MessageEntityTypeBotCommand {
-		return ""
-	}
-
-	if len(m.Text) == entity.Length {
-		return ""
-	}
-
-	return m.Text[entity.Length+1:]
-}

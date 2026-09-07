@@ -22,23 +22,21 @@ type Fetcher interface {
 type Deckbox struct {
 	log     *slog.Logger
 	storage DeckboxSaver
+	admin   AdminStore
 	scraper Fetcher
 
 	refreshHours   int // age at which a Deckbox User's lists are auto-refreshed
 	freshnessHours int // age below which Suggest skips a Deckbox User
-
-	// savedHashes remembers the BodyHash of the last successfully saved export
-	// per listId, so refresh cycles skip the expensive delete+insert when the
-	// list did not change on Deckbox (the common case). Entries are only written
-	// after a successful save, and the cache starts empty — so a skip can never
-	// hide unsaved data.
-	savedHashes sync.Map // map[int64]uint64
 }
 
-func New(log *slog.Logger, storage DeckboxSaver, scraper Fetcher, refreshHours, freshnessHours int) *Deckbox {
+// New wires one Deckbox. storage and admin are two interfaces over the same
+// implementation in production; keeping them apart means a test of search or
+// Refresh never has to satisfy the Admin Panel's queries.
+func New(log *slog.Logger, storage DeckboxSaver, admin AdminStore, scraper Fetcher, refreshHours, freshnessHours int) *Deckbox {
 	return &Deckbox{
 		log:            log,
 		storage:        storage,
+		admin:          admin,
 		scraper:        scraper,
 		refreshHours:   refreshHours,
 		freshnessHours: freshnessHours,
@@ -81,49 +79,35 @@ func (d *Deckbox) Register(ctx context.Context, r Registration) error {
 	return nil
 }
 
-// saveCardListIfChanged saves the list unless its body hash matches the last
-// successful save for that listId. Returns false only when saving failed.
-func (d *Deckbox) saveCardListIfChanged(ctx context.Context, log *slog.Logger, cardList CardList) bool {
-	if cardList.BodyHash != 0 {
-		if prev, ok := d.savedHashes.Load(cardList.ListId); ok && prev.(uint64) == cardList.BodyHash {
-			log.Debug("card list unchanged, skipping save", slog.Int64("list_id", cardList.ListId))
-			return true
-		}
-	}
-	if err := d.storage.SaveCardList(ctx, cardList); err != nil {
-		log.Error("failed to save card list", sl.Err(err))
-		return false
-	}
-	if cardList.BodyHash != 0 {
-		d.savedHashes.Store(cardList.ListId, cardList.BodyHash)
-	}
-	return true
-}
+// refreshUser fetches one Deckbox User's profile and all three Card Lists and
+// reports what happened. It saves the lists but records nothing about the
+// attempt itself: refreshUsers interprets the outcome and stores it, so what
+// happened and what that means stay one decision in one place.
+func (d *Deckbox) refreshUser(ctx context.Context, log *slog.Logger, login string) RefreshOutcome {
+	outcome := RefreshOutcome{DeckboxLogin: login}
 
-// refreshUser fetches one Deckbox User's profile and all three Card Lists, and
-// stamps updated_at when at least one list was saved.
-func (d *Deckbox) refreshUser(ctx context.Context, log *slog.Logger, login string) (cardCount int, errStr string) {
 	select {
 	case <-ctx.Done():
-		return 0, ctx.Err().Error()
+		outcome.Err = ctx.Err().Error()
+		return outcome
 	default:
 	}
 
 	user, err := d.scraper.FetchDeckboxUserProfile(ctx, login)
 	if err != nil {
 		log.Error("failed to fetch user profile", sl.Err(err))
-		return 0, d.recordFailure(ctx, log, login, fmt.Sprintf("failed to fetch profile: %v", err))
+		outcome.Err = fmt.Sprintf("failed to fetch profile: %v", err)
+		return outcome
 	}
 
-	err = d.storage.SaveDeckboxUser(ctx, user)
-	if err != nil {
+	if err := d.storage.SaveDeckboxUser(ctx, user); err != nil {
 		log.Error("failed to save deckbox user", sl.Err(err))
-		return 0, d.recordFailure(ctx, log, login, fmt.Sprintf("failed to save user: %v", err))
+		outcome.Err = fmt.Sprintf("failed to save user: %v", err)
+		return outcome
 	}
+	outcome.ProfileSaved = true
 
-	totalCards := 0
-	var sizes []ListSize
-
+	var failures []string
 	for _, l := range []struct {
 		name string
 		id   *int64
@@ -138,52 +122,49 @@ func (d *Deckbox) refreshUser(ctx context.Context, log *slog.Logger, login strin
 		cardList, err := d.scraper.FetchCardList(ctx, *l.id)
 		if err != nil {
 			log.Error("failed to fetch "+l.name, sl.Err(err))
+			failures = append(failures, fmt.Sprintf("%s: %v", l.name, err))
 			continue
 		}
-		if d.saveCardListIfChanged(ctx, log, cardList) {
-			totalCards += len(cardList.Cards)
-			sizes = append(sizes, ListSize{ListId: cardList.ListId, CardCount: len(cardList.Cards)})
+		// Storage skips the rewrite itself when the export is unchanged, so a
+		// successful save says nothing about whether rows actually moved — the
+		// list is up to date either way.
+		if err := d.storage.SaveCardList(ctx, cardList); err != nil {
+			log.Error("failed to save "+l.name, sl.Err(err))
+			failures = append(failures, fmt.Sprintf("%s: %v", l.name, err))
+			continue
 		}
+		outcome.CardCount += len(cardList.Cards)
+		outcome.Lists = append(outcome.Lists, ListSize{ListId: cardList.ListId, CardCount: len(cardList.Cards)})
 	}
+	outcome.Err = strings.Join(failures, "; ")
 
-	// One write records the outcome and the day's list sizes together. A failed
-	// refresh deliberately leaves updated_at alone so the user stays stale and
-	// the ticker retries them — but its error still has to reach the panel.
-	outcome := RefreshOutcome{DeckboxLogin: login, CardCount: totalCards, Lists: sizes}
-	if totalCards == 0 {
-		// No cards processed indicates possible errors fetching/saving lists
-		return 0, d.recordFailure(ctx, log, login, "failed to refresh lists or no cards found")
+	return outcome
+}
+
+// record stamps and stores one Refresh outcome, and is the only place a Refresh
+// is judged.
+//
+// Reaching and saving the profile is what counts as success. An empty
+// collection is a legitimate answer, not a failure — refusing to stamp
+// updated_at for one leaves that Deckbox User permanently stale, and the ticker
+// re-scrapes them every 30 seconds forever. A Card List that could not be
+// fetched is recorded in Err for the Admin Panel and retried in the next
+// refresh window, for the same reason.
+func (d *Deckbox) record(ctx context.Context, log *slog.Logger, outcome RefreshOutcome) RefreshOutcome {
+	if outcome.ProfileSaved {
+		now := time.Now().Unix()
+		outcome.UpdatedAt = &now
 	}
-
-	now := time.Now().Unix()
-	outcome.UpdatedAt = &now
 	if err := d.storage.SaveRefreshOutcome(ctx, outcome); err != nil {
 		log.Error("failed to save refresh outcome", sl.Err(err))
-		return 0, fmt.Sprintf("failed to update timestamp: %v", err)
 	}
-
-	return totalCards, ""
-}
-
-// recordFailure stores why a Refresh failed and echoes the message back, so the
-// Admin Panel can show what the logs used to be the only record of.
-func (d *Deckbox) recordFailure(ctx context.Context, log *slog.Logger, login, msg string) string {
-	if err := d.storage.SaveRefreshOutcome(ctx, RefreshOutcome{DeckboxLogin: login, Err: msg}); err != nil {
-		log.Warn("failed to record refresh failure", sl.Err(err))
-	}
-	return msg
-}
-
-type refreshResult struct {
-	login string
-	cards int
-	err   string
+	return outcome
 }
 
 // refreshUsers runs refreshUser over logins with numWorkers in flight.
-func (d *Deckbox) refreshUsers(ctx context.Context, logins []string, numWorkers int) []refreshResult {
+func (d *Deckbox) refreshUsers(ctx context.Context, logins []string, numWorkers int) []RefreshOutcome {
 	jobs := make(chan string, len(logins))
-	results := make(chan refreshResult, len(logins))
+	results := make(chan RefreshOutcome, len(logins))
 	var wg sync.WaitGroup
 
 	// Start workers
@@ -200,8 +181,7 @@ func (d *Deckbox) refreshUsers(ctx context.Context, logins []string, numWorkers 
 						return
 					}
 					workerLog := d.log.With(slog.String("deckbox_id", login), slog.Int("worker_id", workerID))
-					cards, errStr := d.refreshUser(ctx, workerLog, login)
-					results <- refreshResult{login: login, cards: cards, err: errStr}
+					results <- d.record(ctx, workerLog, d.refreshUser(ctx, workerLog, login))
 				}
 			}
 		}(i)
@@ -216,7 +196,7 @@ func (d *Deckbox) refreshUsers(ctx context.Context, logins []string, numWorkers 
 	}()
 
 	// Collect results
-	collectedResults := []refreshResult{}
+	collectedResults := []RefreshOutcome{}
 	go func() {
 		wg.Wait()
 		close(results)
@@ -250,8 +230,8 @@ func (d *Deckbox) RefreshStale(ctx context.Context) {
 	log.Info("starting refresh of stale user lists", slog.Int("user_count", len(staleLogins)))
 
 	for _, res := range d.refreshUsers(ctx, staleLogins, 10) {
-		if res.err != "" {
-			log.Error("failed to refresh user", slog.String("deckbox_id", res.login), slog.String("error", res.err))
+		if res.Err != "" {
+			log.Error("refresh reported problems", slog.String("deckbox_id", res.DeckboxLogin), slog.String("error", res.Err))
 		}
 	}
 
@@ -308,12 +288,15 @@ func (d *Deckbox) Suggest(ctx context.Context, logins []string) SuggestResult {
 		return result
 	}
 
+	// A Deckbox User we read counts as processed even when a Card List came back
+	// empty or failed; the problem is reported alongside, not instead.
 	for _, res := range d.refreshUsers(ctx, toProcess, 5) {
-		if res.err != "" {
-			result.Errors = append(result.Errors, res.err)
-		} else if res.cards > 0 {
+		if res.Err != "" {
+			result.Errors = append(result.Errors, res.Err)
+		}
+		if res.ProfileSaved {
 			result.ProcessedCount++
-			result.TotalCards += res.cards
+			result.TotalCards += res.CardCount
 		}
 	}
 
@@ -349,7 +332,7 @@ func ParseExactQuery(q string) (string, bool) {
 }
 
 // ParseQuery turns one raw input line into a Query for the given scope.
-func ParseQuery(raw, scope string) Query {
+func ParseQuery(raw string, scope Scope) Query {
 	name, exact := ParseExactQuery(raw)
 	return Query{Name: name, Exact: exact, Scope: scope}
 }
@@ -357,9 +340,9 @@ func ParseQuery(raw, scope string) Query {
 // Search runs one query per card name and aggregates the matches by Card List,
 // ranking owners by how much of the requested set they hold. A single name is
 // simply the n=1 case.
-func (d *Deckbox) Search(ctx context.Context, cardNames []string, scope string) (SearchResult, error) {
+func (d *Deckbox) Search(ctx context.Context, cardNames []string, scope Scope) (SearchResult, error) {
 	const op = "deckbox.Search"
-	log := d.log.With(slog.String("operation", op), slog.Int("card_count", len(cardNames)), slog.String("scope", scope))
+	log := d.log.With(slog.String("operation", op), slog.Int("card_count", len(cardNames)), slog.String("scope", string(scope)))
 
 	// Parse quoting once up front so the stripped names — not the raw quoted
 	// lines — are what the searches run on and what SearchQueries and NotFound

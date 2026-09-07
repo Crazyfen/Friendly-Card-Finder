@@ -10,7 +10,6 @@ import (
 	"log/slog"
 	"net/http"
 	"net/url"
-	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -38,6 +37,9 @@ func (s *Scraper) fetchPage(ctx context.Context, pageURL, cookie string, log *sl
 		body, finalURL, err = s.fetchPageOnce(ctx, pageURL, cookie)
 		if err == nil {
 			return body, finalURL, nil
+		}
+		if i == maxAttempts-1 {
+			break // no point backing off before giving up
 		}
 		log.Warn("fetch failed, retrying", slog.String("url", pageURL), slog.Int("attempt", i+1), slog.String("error", err.Error()))
 
@@ -81,16 +83,28 @@ func (s *Scraper) FetchDeckboxUserProfile(ctx context.Context, deckboxLogin stri
 	const op = "scrapper.FetchDeckboxUserProfile"
 	log := s.log.With(slog.String("operation", op), slog.String("deckbox_id", deckboxLogin))
 
-	body, _, err := s.fetchPage(ctx, ProfileURL+deckboxLogin, "", log)
+	body, _, err := s.fetchPage(ctx, s.baseURL+"/users/"+deckboxLogin, "", log)
 	if err != nil {
 		log.Error("failed to visit profile page", slog.String("error", err.Error()))
 		return DeckboxUser{}, err
 	}
 
-	doc, err := goquery.NewDocumentFromReader(bytes.NewReader(body))
+	user, err := parseProfile(deckboxLogin, body)
 	if err != nil {
 		log.Error("failed to parse profile page", slog.String("error", err.Error()))
 		return DeckboxUser{}, err
+	}
+
+	return user, nil
+}
+
+// parseProfile reads the three Card List ids out of a Deckbox profile page. A
+// list the profile does not show stays nil, which is how a Deckbox User with no
+// wishlist is represented all the way down to storage.
+func parseProfile(deckboxLogin string, rawBody []byte) (DeckboxUser, error) {
+	doc, err := goquery.NewDocumentFromReader(bytes.NewReader(rawBody))
+	if err != nil {
+		return DeckboxUser{}, fmt.Errorf("parse profile html: %w", err)
 	}
 
 	user := DeckboxUser{
@@ -122,7 +136,7 @@ func (s *Scraper) FetchCardList(ctx context.Context, listId int64) (CardList, er
 	const op = "scrapper.FetchCardList"
 	log := s.log.With(slog.String("operation", op), slog.Int64("list_id", listId))
 
-	cookie, err := s.cookie(ctx)
+	cookie, err := s.session.Cookie(ctx)
 	if err != nil {
 		return CardList{}, fmt.Errorf("%s: %w", op, err)
 	}
@@ -136,7 +150,7 @@ func (s *Scraper) FetchCardList(ctx context.Context, listId int64) (CardList, er
 	// once and retry, so an expired cookie self-heals without manual intervention.
 	if authFailed {
 		log.Warn("card list export looks unauthenticated, re-logging in")
-		cookie, err = s.refreshCookie(ctx, cookie)
+		cookie, err = s.session.Refresh(ctx, cookie)
 		if err != nil {
 			return CardList{}, fmt.Errorf("%s: %w", op, err)
 		}
@@ -156,7 +170,7 @@ func (s *Scraper) FetchCardList(ctx context.Context, listId int64) (CardList, er
 // returns authFailed=true when the response was the login page rather than the
 // export (an invalid/expired cookie), so the caller can re-login and retry.
 func (s *Scraper) fetchCardListOnce(ctx context.Context, listId int64, cookie string, log *slog.Logger) (CardList, bool, error) {
-	exportURL := ExportURL + strconv.FormatInt(listId, 10) + "/export"
+	exportURL := s.baseURL + "/sets/" + strconv.FormatInt(listId, 10) + "/export"
 
 	rawBody, finalURL, err := s.fetchPage(ctx, exportURL, cookie, log)
 	if err != nil {
@@ -170,12 +184,24 @@ func (s *Scraper) fetchCardListOnce(ctx context.Context, listId int64, cookie st
 		return CardList{}, true, nil
 	}
 
+	cardList, authFailed := parseExport(listId, rawBody, log)
+	return cardList, authFailed, nil
+}
+
+// parseExport turns an export response body into a Card List, and reports
+// authFailed when Deckbox served the login page instead of the export — which is
+// how a rejected session cookie arrives inside a 200 response.
+//
+// This is the seam: everything above it needs the network, everything below it
+// needs only bytes, so the export format is described by tests rather than by a
+// live account. See docs/adr/0008 for why the export page is the source at all.
+func parseExport(listId int64, rawBody []byte, log *slog.Logger) (CardList, bool) {
 	// The export is plain text ("<qty> <name>" joined by <br/>), so parse the
 	// raw response body directly without building a DOM.
 	body := bodyInnerHTML(string(rawBody))
 	// Belt-and-suspenders: detect the login form in the body too.
 	if strings.Contains(body, "name='authenticity_token'") || strings.Contains(body, `name="authenticity_token"`) {
-		return CardList{}, true, nil
+		return CardList{}, true
 	}
 
 	h := fnv.New64a()
@@ -185,60 +211,7 @@ func (s *Scraper) fetchCardListOnce(ctx context.Context, listId int64, cookie st
 		ListId:   listId,
 		Cards:    parseCardListExport(body, log),
 		BodyHash: h.Sum64(),
-	}, false, nil
-}
-
-// cookie returns a usable _tcg_session value, resolving in priority order:
-// in-memory cache, env override, persisted file, then a fresh login.
-func (s *Scraper) cookie(ctx context.Context) (string, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	if s.sessionCookie != "" {
-		return s.sessionCookie, nil
-	}
-	if s.cookieOverride != "" {
-		s.sessionCookie = s.cookieOverride
-		return s.sessionCookie, nil
-	}
-	if c := readCookieFile(s.cookiePath); c != "" {
-		s.sessionCookie = c
-		return s.sessionCookie, nil
-	}
-	return s.loginLocked(ctx)
-}
-
-// refreshCookie forces a re-login when the cached cookie was rejected. previous
-// is the cookie the caller just tried; if another goroutine already refreshed it
-// in the meantime, that newer value is returned without a redundant login.
-func (s *Scraper) refreshCookie(ctx context.Context, previous string) (string, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	if s.sessionCookie != "" && s.sessionCookie != previous {
-		return s.sessionCookie, nil
-	}
-	if s.login == "" || s.password == "" {
-		return "", fmt.Errorf("session cookie rejected and no credentials configured to re-login")
-	}
-	return s.loginLocked(ctx)
-}
-
-// loginLocked performs a login, then caches and persists the cookie.
-// The caller must hold s.mu.
-func (s *Scraper) loginLocked(ctx context.Context) (string, error) {
-	if s.login == "" || s.password == "" {
-		return "", fmt.Errorf("no deckbox credentials configured")
-	}
-	cookie, err := s.doLogin(ctx)
-	if err != nil {
-		return "", err
-	}
-	s.sessionCookie = cookie
-	if err := writeCookieFile(s.cookiePath, cookie); err != nil {
-		s.log.Warn("failed to persist session cookie", slog.String("error", err.Error()))
-	}
-	return cookie, nil
+	}, false
 }
 
 // doLogin authenticates against Deckbox and returns the _tcg_session cookie value.
@@ -248,7 +221,13 @@ func (s *Scraper) doLogin(ctx context.Context) (string, error) {
 	const op = "scrapper.doLogin"
 	log := s.log.With(slog.String("operation", op))
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, LoginURL, nil)
+	if s.login == "" || s.password == "" {
+		return "", fmt.Errorf("%s: no deckbox credentials configured", op)
+	}
+
+	loginURL := s.baseURL + "/accounts/login"
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, loginURL, nil)
 	if err != nil {
 		return "", fmt.Errorf("%s: %w", op, err)
 	}
@@ -273,7 +252,7 @@ func (s *Scraper) doLogin(ctx context.Context) (string, error) {
 		"login":              {s.login},
 		"password":           {s.password},
 	}
-	postReq, err := http.NewRequestWithContext(ctx, http.MethodPost, LoginURL, strings.NewReader(form.Encode()))
+	postReq, err := http.NewRequestWithContext(ctx, http.MethodPost, loginURL, strings.NewReader(form.Encode()))
 	if err != nil {
 		return "", fmt.Errorf("%s: %w", op, err)
 	}
@@ -291,7 +270,7 @@ func (s *Scraper) doLogin(ctx context.Context) (string, error) {
 		return "", fmt.Errorf("%s: login failed (status %d) — check DECKBOX_LOGIN/DECKBOX_PASSWORD", op, postResp.StatusCode)
 	}
 
-	u, err := url.Parse(DeckboxBaseURL)
+	u, err := url.Parse(s.baseURL)
 	if err != nil {
 		return "", fmt.Errorf("%s: %w", op, err)
 	}
@@ -315,28 +294,6 @@ func parseAuthenticityToken(body string) (string, error) {
 		return "", fmt.Errorf("authenticity_token not found in login page")
 	}
 	return strings.TrimSpace(token), nil
-}
-
-// readCookieFile returns the persisted cookie value, or "" if the file is
-// missing/unreadable. A missing file is the normal first-run case.
-func readCookieFile(path string) string {
-	if path == "" {
-		return ""
-	}
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return ""
-	}
-	return strings.TrimSpace(string(data))
-}
-
-// writeCookieFile persists the session cookie with owner-only permissions
-// (it is a secret).
-func writeCookieFile(path, cookie string) error {
-	if path == "" {
-		return nil
-	}
-	return os.WriteFile(path, []byte(cookie), 0o600)
 }
 
 // bodyInnerHTML returns the markup between the opening <body ...> tag and the
@@ -363,8 +320,14 @@ func bodyInnerHTML(s string) string {
 
 // parseCardListExport parses the raw HTML body of a Deckbox set export page into
 // a map of card name -> quantity. The export format is "<qty> <card name>"
-// entries separated by <br/> tags. Quantities for duplicate names are summed;
-// malformed entries are logged and skipped.
+// entries separated by <br/> tags.
+//
+// A name can appear on several lines and the quantities are summed, because the
+// export carries no variation data (set, printing, foil) — the repeated lines are
+// the same card in different variations, so their total is the only number that
+// exists. Do not "fix" this into a de-duplication.
+//
+// Malformed entries are logged and skipped.
 func parseCardListExport(body string, log *slog.Logger) map[string]int16 {
 	// Pre-size to the entry count so a 10k-card export doesn't rehash the map
 	// ~14 times while growing; one extra O(n) scan is far cheaper.

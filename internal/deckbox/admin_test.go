@@ -2,38 +2,28 @@ package deckbox
 
 import (
 	"context"
-	"log/slog"
 	"testing"
 	"time"
 )
 
-func TestPurgeInvalidatesSavedHashes(t *testing.T) {
-	// The BodyHash cache lives in memory, so a Purge that only cleared the
-	// database would leave saveCardListIfChanged convinced the deleted lists are
-	// still saved — and a re-registration of the same login would stay empty.
+func TestPurgeReportsWhatStorageRemoved(t *testing.T) {
+	// The unchanged-list skip is stored with the rows it describes (see
+	// TestPurgeDropsStoredBodyHash in internal/storage/sqlite), so Purge has
+	// nothing to invalidate — it forwards the login and reports the result.
 	ctx := context.Background()
-	log := slog.Default()
 
-	storage := &fakeStorage{purgeResult: PurgeResult{ListIDs: []int64{1}}}
-	d := newTestDeckbox(storage, &fakeScraper{})
-	list := CardList{ListId: 1, Cards: map[string]int16{"Shock": 1}, BodyHash: 42}
+	store := &fakeAdmin{purgeResult: PurgeResult{ListIDs: []int64{1, 2}, CardRows: 7, Registration: true}}
+	d := newTestDeckboxAdmin(store)
 
-	d.saveCardListIfChanged(ctx, log, list)
-	d.saveCardListIfChanged(ctx, log, list)
-	if got := storage.saveCalls(); got != 1 {
-		t.Fatalf("expected the unchanged list to be skipped once cached, saves=%d", got)
-	}
-
-	if _, err := d.Purge(ctx, "petya"); err != nil {
+	res, err := d.Purge(ctx, "petya")
+	if err != nil {
 		t.Fatalf("purge failed: %v", err)
 	}
-	if storage.purgedLogin != "petya" {
-		t.Errorf("expected petya to be purged, got %q", storage.purgedLogin)
+	if store.purgedLogin != "petya" {
+		t.Errorf("expected petya to be purged, got %q", store.purgedLogin)
 	}
-
-	d.saveCardListIfChanged(ctx, log, list)
-	if got := storage.saveCalls(); got != 2 {
-		t.Fatalf("purge did not invalidate the BodyHash cache: saves=%d, want 2", got)
+	if len(res.ListIDs) != 2 || res.CardRows != 7 || !res.Registration {
+		t.Errorf("purge result not passed through, got %+v", res)
 	}
 }
 
@@ -81,23 +71,21 @@ func TestSearchRecordsDemand(t *testing.T) {
 	}
 }
 
-func TestUnlinkDoesNotTouchHashes(t *testing.T) {
-	// Unlink leaves the collection in place, so the cache must survive it —
-	// otherwise every unlink would force a full re-save of three lists.
+func TestUnlinkLeavesTheCollection(t *testing.T) {
+	// Unlink removes only the registration, so it must never reach the Card
+	// Lists — the Deckbox User stays searchable under its login.
 	ctx := context.Background()
-	log := slog.Default()
 
-	storage := &fakeStorage{}
-	d := newTestDeckbox(storage, &fakeScraper{})
-	list := CardList{ListId: 1, Cards: map[string]int16{"Shock": 1}, BodyHash: 42}
+	store := &fakeAdmin{}
+	d := newTestDeckboxAdmin(store)
 
-	d.saveCardListIfChanged(ctx, log, list)
 	if err := d.Unlink(ctx, "petya"); err != nil {
 		t.Fatalf("unlink failed: %v", err)
 	}
-	d.saveCardListIfChanged(ctx, log, list)
-
-	if got := storage.saveCalls(); got != 1 {
-		t.Errorf("unlink should not invalidate the BodyHash cache, saves=%d", got)
+	if store.unlinkedLogin != "petya" {
+		t.Errorf("expected petya to be unlinked, got %q", store.unlinkedLogin)
+	}
+	if store.purgedLogin != "" {
+		t.Errorf("unlink must not purge, purged %q", store.purgedLogin)
 	}
 }

@@ -15,8 +15,11 @@ import (
 
 // fakeService records what the panel asked the domain to do.
 type fakeService struct {
-	purged []string
-	users  []deckbox.AdminUser
+	purged     []string
+	unlinked   []string
+	refreshed  []string
+	refreshErr error
+	users      []deckbox.AdminUser
 }
 
 func (f *fakeService) AdminOverview(ctx context.Context) (deckbox.Overview, error) {
@@ -32,8 +35,40 @@ func (f *fakeService) Purge(ctx context.Context, login string) (deckbox.PurgeRes
 	f.purged = append(f.purged, login)
 	return deckbox.PurgeResult{ListIDs: []int64{1, 2, 3}, CardRows: 12, Registration: true}, nil
 }
-func (f *fakeService) Unlink(ctx context.Context, login string) error     { return nil }
-func (f *fakeService) RefreshNow(ctx context.Context, login string) error { return nil }
+func (f *fakeService) Unlink(ctx context.Context, login string) error {
+	f.unlinked = append(f.unlinked, login)
+	return nil
+}
+func (f *fakeService) RefreshNow(ctx context.Context, login string) error {
+	f.refreshed = append(f.refreshed, login)
+	return f.refreshErr
+}
+
+// post issues an authenticated same-origin form POST, the way the panel's own
+// pages do.
+func post(t *testing.T, h http.Handler, path, body string) *httptest.ResponseRecorder {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodPost, path, strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("Sec-Fetch-Site", "same-origin")
+	req.SetBasicAuth("admin", "hunter2")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	return rec
+}
+
+// redirectMsg is the outcome the panel hands back through the query string.
+func redirectMsg(t *testing.T, rec *httptest.ResponseRecorder) string {
+	t.Helper()
+	if rec.Code != http.StatusSeeOther {
+		t.Fatalf("expected a redirect after the action, got %d", rec.Code)
+	}
+	loc, err := url.Parse(rec.Header().Get("Location"))
+	if err != nil {
+		t.Fatalf("bad redirect location: %v", err)
+	}
+	return loc.Query().Get("msg")
+}
 
 func newTestServer(t *testing.T, svc Service) http.Handler {
 	t.Helper()
@@ -215,4 +250,78 @@ func firstLines(s string) string {
 		return s[:200] + "…"
 	}
 	return s
+}
+
+// --- the other mutating routes ------------------------------------------------
+
+func TestUnlinkRemovesOnlyTheRegistration(t *testing.T) {
+	svc := &fakeService{}
+	h := newTestServer(t, svc)
+
+	msg := redirectMsg(t, post(t, h, "/unlink", "login=petya"))
+
+	if len(svc.unlinked) != 1 || svc.unlinked[0] != "petya" {
+		t.Fatalf("expected petya unlinked, got %v", svc.unlinked)
+	}
+	if len(svc.purged) != 0 {
+		t.Errorf("unlink must never purge, purged %v", svc.purged)
+	}
+	if !strings.Contains(msg, "petya") {
+		t.Errorf("expected the outcome to name the login, got %q", msg)
+	}
+}
+
+func TestRefreshAndAddShareOnePathAndDifferInWording(t *testing.T) {
+	// Adding an unknown login *is* a Refresh — it creates the Deckbox User — so
+	// the two routes must reach the same operation and only read differently.
+	tests := []struct {
+		path     string
+		wantWord string
+		wantFail string
+	}{
+		{"/refresh", "refreshed petya", "refresh petya failed"},
+		{"/add", "added petya", "add petya failed"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.path, func(t *testing.T) {
+			svc := &fakeService{}
+			h := newTestServer(t, svc)
+
+			msg := redirectMsg(t, post(t, h, tt.path, "login=petya"))
+			if len(svc.refreshed) != 1 || svc.refreshed[0] != "petya" {
+				t.Fatalf("expected one refresh of petya, got %v", svc.refreshed)
+			}
+			if !strings.Contains(msg, tt.wantWord) {
+				t.Errorf("outcome = %q, want it to say %q", msg, tt.wantWord)
+			}
+
+			// A failure reports the same action in the present tense.
+			failing := &fakeService{refreshErr: errors.New("profile 404")}
+			msg = redirectMsg(t, post(t, newTestServer(t, failing), tt.path, "login=petya"))
+			if !strings.Contains(msg, tt.wantFail) {
+				t.Errorf("failure = %q, want it to say %q", msg, tt.wantFail)
+			}
+			if !strings.Contains(msg, "profile 404") {
+				t.Errorf("failure = %q, want it to carry the cause", msg)
+			}
+		})
+	}
+}
+
+func TestMutatingRoutesRefuseAnEmptyLogin(t *testing.T) {
+	// An empty form field must not reach the domain as an empty login.
+	for _, path := range []string{"/purge", "/unlink", "/refresh", "/add"} {
+		t.Run(path, func(t *testing.T) {
+			svc := &fakeService{}
+			h := newTestServer(t, svc)
+
+			if msg := redirectMsg(t, post(t, h, path, "login=  ")); !strings.Contains(msg, "no login given") {
+				t.Errorf("outcome = %q, want it to refuse", msg)
+			}
+			if len(svc.purged)+len(svc.unlinked)+len(svc.refreshed) != 0 {
+				t.Error("an empty login must not reach the domain")
+			}
+		})
+	}
 }
