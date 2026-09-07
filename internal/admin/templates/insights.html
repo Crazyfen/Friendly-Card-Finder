@@ -1,0 +1,123 @@
+{{define "content"}}
+<div class="tiles">
+  {{range .Tiles}}
+  <div class="tile {{.Status}}">
+    <div class="label">{{.Label}}</div>
+    <div class="value">{{.Value}}</div>
+    <div class="note">{{.Note}}</div>
+  </div>
+  {{end}}
+</div>
+<p class="sub" style="margin-top:10px">Computed at {{.ComputedAt}}, reused for five minutes. <a href="/insights?refresh=1">Recompute now</a>.</p>
+
+<h2>Searches per day</h2>
+<p class="sub">Daily totals; hover a point for that day's misses. No search text or searcher is stored — only these counts.</p>
+{{with .Spark}}
+  {{if .Empty}}
+    <p class="muted">No searches recorded yet.</p>
+  {{else}}
+    <svg class="spark" viewBox="0 0 {{.Width}} {{.Height}}" width="{{.Width}}" height="{{.Height}}"
+         role="img" aria-label="Searches per day, peak {{.Max}}">
+      <polyline points="{{.Points}}" fill="none" stroke="var(--series-1)" stroke-width="2"
+                stroke-linejoin="round" stroke-linecap="round"/>
+      {{range .Marks}}
+      <circle cx="{{.X}}" cy="{{.Y}}" r="4" fill="var(--series-1)" stroke="var(--surface)" stroke-width="2">
+        <title>{{.Title}}</title>
+      </circle>
+      {{end}}
+    </svg>
+    <div class="spark-axis">
+      <span>{{.FirstDay}}</span>
+      <span>peak {{.Max}} · latest {{.Latest}} ({{.LastDay}})</span>
+    </div>
+  {{end}}
+{{end}}
+
+<h2>Demand gap</h2>
+<p class="sub">What people searched for, ranked by how often nobody had it. This is the acquisition list.</p>
+{{if not .Demand}}
+<p class="muted">No searches recorded yet.</p>
+{{else}}
+<div class="scroll">
+<table>
+  <thead><tr><th>Search Term</th><th>Scope</th><th class="num">Missed</th><th class="barcell"></th><th class="num">Found</th><th>Last</th></tr></thead>
+  <tbody>
+  {{range .Demand}}
+    <tr>
+      <td>{{.Term}}</td>
+      <td class="muted">{{.Scope}}</td>
+      <td class="num">{{.Misses}}</td>
+      <td class="barcell"><div class="bar" style="width:{{.Width}}%" title="{{.Misses}} missed"></div></td>
+      <td class="num muted">{{.Hits}}</td>
+      <td class="muted">{{.Last}}</td>
+    </tr>
+  {{end}}
+  </tbody>
+</table>
+</div>
+{{end}}
+
+<h2>Most wanted</h2>
+<p class="sub">Cards on the most wishlists. Independent of search — this is standing demand.</p>
+{{if not .MostWanted}}
+<p class="muted">No wishlists tracked yet.</p>
+{{else}}
+<div class="scroll">
+<table>
+  <thead><tr><th>Card</th><th class="num">Wishers</th><th class="barcell"></th></tr></thead>
+  <tbody>
+  {{range .MostWanted}}
+    <tr>
+      <td>{{.CardName}}</td>
+      <td class="num">{{.Wishers}}</td>
+      <td class="barcell"><div class="bar" style="width:{{.Width}}%" title="{{.Wishers}} wishers"></div></td>
+    </tr>
+  {{end}}
+  </tbody>
+</table>
+</div>
+{{end}}
+
+<h2>Trade Matches</h2>
+<p class="sub">{{.TradeTotal}} pairs where one user wants a card another user trades. Showing the first {{.TradeShown}}, grouped by who wants it.</p>
+{{if not .Trades}}
+<p class="muted">No matches — needs both wishlists and tradelists to be populated.</p>
+{{else}}
+<div class="scroll">
+<table>
+  <thead><tr><th>Wants</th><th>Card</th><th>Held by</th><th class="num">Qty</th></tr></thead>
+  <tbody>
+  {{range .Trades}}
+    <tr>
+      <td>{{.Wisher}}</td>
+      <td>{{.CardName}}</td>
+      <td>{{.Holder}}</td>
+      <td class="num">{{.Quantity}}</td>
+    </tr>
+  {{end}}
+  </tbody>
+</table>
+</div>
+{{end}}
+
+<h2>Supply concentration</h2>
+<p class="sub">How many distinct cards are carried by exactly N tradelists. The top row is the fragile supply: lose that owner and the card leaves the network.</p>
+{{if not .Supply}}
+<p class="muted">No tradelists tracked yet.</p>
+{{else}}
+<div class="scroll">
+<table>
+  <thead><tr><th>Owners</th><th class="num">Cards</th><th class="barcell"></th></tr></thead>
+  <tbody>
+  {{range .Supply}}
+    <tr>
+      <td>{{.Owners}}</td>
+      <td class="num">{{.Cards}}</td>
+      <td class="barcell"><div class="bar" style="width:{{.Width}}%" title="{{.Cards}} cards held by {{.Owners}} owner(s)"></div></td>
+    </tr>
+  {{end}}
+  </tbody>
+</table>
+</div>
+{{end}}
+{{end}}

@@ -6,3 +6,26 @@ services:
     volumes:
       - ./storage:/app/storage
       - ./.env:/app/.env
+    # Deliberately no ports: the Admin Panel listens on :8081 inside the compose
+    # network and is reachable only through caddy, so there is no route that
+    # bypasses TLS and Basic Auth. See docs/adr/0003.
+
+  caddy:
+    image: caddy:alpine
+    restart: unless-stopped
+    env_file: .env
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      - bot
+
+volumes:
+  # Named so the issued certificate survives a redeploy; losing it means
+  # re-requesting from Let's Encrypt on every restart.
+  caddy_data:
+  caddy_config:

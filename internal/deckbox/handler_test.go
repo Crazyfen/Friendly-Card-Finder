@@ -20,12 +20,23 @@ type fakeStorage struct {
 	// written — so the background refresh Register kicks off can be awaited.
 	timestampUpdated chan struct{}
 
+	// searchRecorded, when non-nil, receives once per RecordSearch call — the
+	// Demand write is fire-and-forget, so tests need something to wait on.
+	searchRecorded chan struct{}
+
+	purgeResult PurgeResult
+	purgeErr    error
+
 	mu                    sync.Mutex // Search runs its queries concurrently
 	saveCardListCalls     int
 	UpdateTimestampCalled bool
 	lastSearchName        string
 	lastSearchExact       bool
 	lastSearchScope       string
+	lastOutcome           RefreshOutcome
+	recordedTerms         []TermStat
+	purgedLogin           string
+	unlinkedLogin         string
 }
 
 func (f *fakeStorage) RegisterUser(ctx context.Context, user BotUser) error        { return nil }
@@ -53,10 +64,15 @@ func (f *fakeStorage) GetDeckboxUser(ctx context.Context, login string) (*Deckbo
 	}
 	return nil, nil
 }
-func (f *fakeStorage) UpdateDeckboxUserTimestamp(ctx context.Context, login string, updatedAt int64) error {
+func (f *fakeStorage) SaveRefreshOutcome(ctx context.Context, o RefreshOutcome) error {
 	f.mu.Lock()
-	first := !f.UpdateTimestampCalled
-	f.UpdateTimestampCalled = true
+	f.lastOutcome = o
+	// Only a successful refresh stamps updated_at; a failure records its error
+	// and leaves the timestamp alone.
+	first := o.UpdatedAt != nil && !f.UpdateTimestampCalled
+	if o.UpdatedAt != nil {
+		f.UpdateTimestampCalled = true
+	}
 	f.mu.Unlock()
 	if first && f.timestampUpdated != nil {
 		close(f.timestampUpdated)
@@ -66,6 +82,39 @@ func (f *fakeStorage) UpdateDeckboxUserTimestamp(ctx context.Context, login stri
 func (f *fakeStorage) GetAllDeckboxUsersWithOldLists(ctx context.Context, thresholdSeconds int64) ([]string, error) {
 	return nil, nil
 }
+
+func (f *fakeStorage) RecordSearch(ctx context.Context, terms []TermStat) error {
+	f.mu.Lock()
+	f.recordedTerms = append(f.recordedTerms, terms...)
+	f.mu.Unlock()
+	if f.searchRecorded != nil {
+		select {
+		case f.searchRecorded <- struct{}{}:
+		default:
+		}
+	}
+	return nil
+}
+
+func (f *fakeStorage) PurgeDeckboxUser(ctx context.Context, login string) (PurgeResult, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.purgedLogin = login
+	return f.purgeResult, f.purgeErr
+}
+
+func (f *fakeStorage) UnlinkBotUser(ctx context.Context, login string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.unlinkedLogin = login
+	return nil
+}
+
+func (f *fakeStorage) AdminOverview(ctx context.Context, staleThreshold int64) (Overview, error) {
+	return Overview{}, nil
+}
+func (f *fakeStorage) AdminUsers(ctx context.Context) ([]AdminUser, error) { return nil, nil }
+func (f *fakeStorage) AdminInsights(ctx context.Context) (Insights, error) { return Insights{}, nil }
 
 func (f *fakeStorage) saveCalls() int {
 	f.mu.Lock()

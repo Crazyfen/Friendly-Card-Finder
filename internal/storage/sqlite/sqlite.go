@@ -199,14 +199,14 @@ func (s *SQLiteStorage) RegisterUser(ctx context.Context, user deckbox.BotUser) 
 	const op = "storage.sqlite.RegisterUser"
 
 	stmt, err := s.writeStmt(ctx, `
-	INSERT INTO users(telegramId, username, deckboxLogin)
-	VALUES (?, ?, ?)
+	INSERT INTO users(telegramId, username, deckboxLogin, created_at)
+	VALUES (?, ?, ?, ?)
 	`)
 	if err != nil {
 		return fmt.Errorf("%s preparing statement: %w", op, err)
 	}
 
-	_, err = stmt.Exec(user.TelegramID, user.TelegramUsername, user.DeckboxLogin)
+	_, err = stmt.Exec(user.TelegramID, user.TelegramUsername, user.DeckboxLogin, time.Now().Unix())
 	if err != nil {
 		return err
 	}
@@ -229,26 +229,6 @@ func (s *SQLiteStorage) SaveDeckboxUser(ctx context.Context, user deckbox.Deckbo
 	}
 
 	_, err = stmt.Exec(user.DeckboxLogin, user.InventoryID, user.TradelistID, user.WishlistID)
-	if err != nil {
-		return fmt.Errorf("%s: %w", op, err)
-	}
-
-	return nil
-}
-
-func (s *SQLiteStorage) UpdateDeckboxUserTimestamp(ctx context.Context, deckboxLogin string, updatedAt int64) error {
-	const op = "storage.sqlite.UpdateDeckboxUserTimestamp"
-
-	stmt, err := s.writeStmt(ctx, `
-	UPDATE deckbox_users
-	SET updated_at = ?
-	WHERE deckboxLogin = ?
-	`)
-	if err != nil {
-		return fmt.Errorf("%s: %w", op, err)
-	}
-
-	_, err = stmt.Exec(updatedAt, deckboxLogin)
 	if err != nil {
 		return fmt.Errorf("%s: %w", op, err)
 	}

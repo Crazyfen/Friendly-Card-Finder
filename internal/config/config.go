@@ -17,6 +17,22 @@ type Config struct {
 	DeckboxCookiePath       string
 	FreshnessTimeLimitHours int
 	CardListRefreshHours    int
+	AdminAddr               string
+	AdminUser               string
+	AdminPassword           string
+}
+
+// defaultAdminAddr is where the Admin Panel listens inside the container. Caddy
+// reaches it over the compose network; the port is never published to the host,
+// so the proxy is the only route in. See docs/adr/0003.
+const defaultAdminAddr = ":8081"
+
+// envOr reads key, falling back to def when unset.
+func envOr(key env.EnvKey, def string) string {
+	if s := key.GetValue(); s != "" {
+		return s
+	}
+	return def
 }
 
 // envInt reads key as an int, falling back to def when unset or unparsable.
@@ -49,6 +65,9 @@ func MustLoad() *Config {
 	}
 
 	return &Config{
+		AdminAddr:               envOr(env.AdminAddr, defaultAdminAddr),
+		AdminUser:               env.AdminUser.GetValue(), // default lives in admin.New
+		AdminPassword:           env.AdminPassword.GetValue(),
 		StoragePath:             storagePath,
 		BotToken:                env.BotToken.GetValue(),
 		Env:                     env.Env.GetValue(),

@@ -1,0 +1,119 @@
+{{define "layout"}}<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>FriendlyCardFinder admin</title>
+<style>
+  :root {
+    color-scheme: light;
+    --surface:        #fcfcfb;
+    --surface-raised: #ffffff;
+    --border:         #e2e1dc;
+    --text-primary:   #0b0b0b;
+    --text-secondary: #52514e;
+    --text-muted:     #78766f;
+    --series-1:       #2a78d6;
+    --series-fill:    #cde2fb;
+    --warn:           #eda100;
+    --bad:            #e34948;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:where(:not([data-theme="light"])) {
+      color-scheme: dark;
+      --surface:        #1a1a19;
+      --surface-raised: #232322;
+      --border:         #383835;
+      --text-primary:   #ffffff;
+      --text-secondary: #c3c2b7;
+      --text-muted:     #97968c;
+      --series-1:       #3987e5;
+      --series-fill:    #184f95;
+      --warn:           #c98500;
+      --bad:            #e66767;
+    }
+  }
+
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    padding: 24px 20px 64px;
+    background: var(--surface);
+    color: var(--text-primary);
+    font: 14px/1.5 ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+  }
+  main { max-width: 1100px; margin: 0 auto; }
+  h1 { font-size: 18px; margin: 0; }
+  h2 { font-size: 15px; margin: 32px 0 4px; }
+  p.sub { margin: 2px 0 12px; color: var(--text-secondary); }
+
+  header.bar { display: flex; align-items: baseline; gap: 16px; flex-wrap: wrap; margin-bottom: 20px; }
+  nav { display: flex; gap: 12px; margin-left: auto; }
+  nav a { color: var(--text-secondary); text-decoration: none; padding-bottom: 2px; }
+  nav a.on { color: var(--text-primary); border-bottom: 2px solid var(--series-1); }
+
+  .msg {
+    background: var(--surface-raised); border: 1px solid var(--border);
+    border-left: 3px solid var(--series-1);
+    padding: 8px 12px; border-radius: 4px; margin-bottom: 16px;
+  }
+
+  .tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 10px; }
+  .tile { background: var(--surface-raised); border: 1px solid var(--border); border-radius: 6px; padding: 12px 14px; }
+  .tile .label { color: var(--text-secondary); font-size: 12px; text-transform: uppercase; letter-spacing: .04em; }
+  .tile .value { font-size: 26px; font-weight: 600; margin: 2px 0; font-variant-numeric: tabular-nums; }
+  .tile .note { color: var(--text-muted); font-size: 12px; }
+  .tile.warn .value { color: var(--warn); }
+  .tile.bad  .value { color: var(--bad); }
+
+  .scroll { overflow-x: auto; }
+  table { border-collapse: collapse; width: 100%; font-variant-numeric: tabular-nums; }
+  th, td { text-align: left; padding: 7px 10px; border-bottom: 1px solid var(--border); white-space: nowrap; }
+  th { color: var(--text-secondary); font-weight: 500; font-size: 12px; text-transform: uppercase; letter-spacing: .04em; }
+  td.num, th.num { text-align: right; }
+  tr:hover td { background: var(--surface-raised); }
+  .muted { color: var(--text-muted); }
+  .err { color: var(--bad); white-space: normal; max-width: 320px; }
+  .warn-text { color: var(--warn); }
+
+  form.inline { display: inline; }
+  button {
+    font: inherit; cursor: pointer; padding: 3px 9px; border-radius: 4px;
+    border: 1px solid var(--border); background: var(--surface-raised); color: var(--text-primary);
+  }
+  button:hover { border-color: var(--series-1); }
+  a.btn {
+    display: inline-block; font: inherit; padding: 3px 9px; border-radius: 4px; text-decoration: none;
+    border: 1px solid var(--border); background: var(--surface-raised); color: var(--text-primary);
+  }
+  a.btn:hover { border-color: var(--series-1); }
+  a.btn.danger:hover { border-color: var(--bad); color: var(--bad); }
+  button.danger:hover { border-color: var(--bad); color: var(--bad); }
+  input[type=text] {
+    font: inherit; padding: 5px 9px; border-radius: 4px;
+    border: 1px solid var(--border); background: var(--surface-raised); color: var(--text-primary);
+    min-width: 220px;
+  }
+
+  /* Bars: one hue, magnitude only. The number is always present in its own
+     cell, so the bar is a reading aid and never the only encoding. */
+  .bar { background: var(--series-fill); height: 10px; border-radius: 0 4px 4px 0; min-width: 2px; }
+  td.barcell { width: 30%; }
+
+  .spark { display: block; max-width: 100%; height: auto; }
+  .spark-axis { color: var(--text-muted); font-size: 12px; display: flex; justify-content: space-between; margin-top: 2px; }
+</style>
+</head>
+<body>
+<main>
+  <header class="bar">
+    <h1>FriendlyCardFinder</h1>
+    <nav>
+      <a href="/" {{if eq .Page "manage"}}class="on"{{end}}>Manage</a>
+      <a href="/insights" {{if eq .Page "insights"}}class="on"{{end}}>Insights</a>
+    </nav>
+  </header>
+  {{template "content" .}}
+</main>
+</body>
+</html>{{end}}

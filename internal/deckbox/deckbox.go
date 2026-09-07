@@ -91,8 +91,19 @@ type DeckboxSaver interface {
 	SaveCardList(ctx context.Context, list CardList) error
 	SearchCard(ctx context.Context, q Query) ([]CardListWithOwner, error)
 	GetDeckboxUser(ctx context.Context, deckboxLogin string) (*DeckboxUser, error)
-	UpdateDeckboxUserTimestamp(ctx context.Context, deckboxLogin string, updatedAt int64) error
+	SaveRefreshOutcome(ctx context.Context, outcome RefreshOutcome) error
 	GetAllDeckboxUsersWithOldLists(ctx context.Context, thresholdSeconds int64) ([]string, error)
+
+	// RecordSearch counts Demand. It is called off the request path and its
+	// failures are logged, never surfaced — see docs/adr/0004.
+	RecordSearch(ctx context.Context, terms []TermStat) error
+
+	// Admin Panel operations.
+	PurgeDeckboxUser(ctx context.Context, deckboxLogin string) (PurgeResult, error)
+	UnlinkBotUser(ctx context.Context, deckboxLogin string) error
+	AdminOverview(ctx context.Context, staleThreshold int64) (Overview, error)
+	AdminUsers(ctx context.Context) ([]AdminUser, error)
+	AdminInsights(ctx context.Context) (Insights, error)
 }
 
 // ScraperAuth holds the credentials and cookie configuration for the Scraper.

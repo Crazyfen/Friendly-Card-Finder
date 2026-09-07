@@ -22,6 +22,9 @@ const (
 	FreshnessTimeLimitHours EnvKey = "FRESHNESS_TIME_LIMIT_HOURS"
 	CardListRefreshHours    EnvKey = "CARD_LIST_REFRESH_HOURS"
 	CardListBatchSize       EnvKey = "CARD_LIST_BATCH_SIZE"
+	AdminAddr               EnvKey = "ADMIN_ADDR"
+	AdminUser               EnvKey = "ADMIN_USER"
+	AdminPassword           EnvKey = "ADMIN_PASSWORD"
 )
 
 func Load() error {

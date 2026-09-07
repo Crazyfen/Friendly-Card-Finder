@@ -1,0 +1,7 @@
+# TLS for the Admin Panel. Caddy fetches and renews the certificate itself, so
+# the bot never sees a certificate or a plaintext password on the wire.
+# The bot publishes no port, so this proxy is the only route to :8081.
+{$ADMIN_DOMAIN:admin.ivash.net} {
+	encode zstd gzip
+	reverse_proxy bot:8081
+}

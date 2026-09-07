@@ -1,0 +1,23 @@
+{{define "content"}}
+<h2>Purge {{.Login}}?</h2>
+<p class="sub">This removes the collection, every card row in its three lists, the search index entries, the size history, and the Telegram registration claiming this login. It cannot be undone — the data comes back only by scraping Deckbox again.</p>
+
+<div class="tiles">
+  <div class="tile"><div class="label">Inventory</div><div class="value">{{.Inventory}}</div><div class="note">rows</div></div>
+  <div class="tile"><div class="label">Tradelist</div><div class="value">{{.Tradelist}}</div><div class="note">rows</div></div>
+  <div class="tile"><div class="label">Wishlist</div><div class="value">{{.Wishlist}}</div><div class="note">rows</div></div>
+  <div class="tile {{if .HasRegistration}}bad{{end}}">
+    <div class="label">Registration</div>
+    <div class="value">{{if .HasRegistration}}yes{{else}}none{{end}}</div>
+    <div class="note">{{.Telegram}}</div>
+  </div>
+</div>
+
+<p style="margin-top:20px">
+  <form class="inline" method="post" action="/purge">
+    <input type="hidden" name="login" value="{{.Login}}">
+    <button type="submit" class="danger">Purge {{.Login}}</button>
+  </form>
+  <a class="btn" href="/">Cancel</a>
+</p>
+{{end}}

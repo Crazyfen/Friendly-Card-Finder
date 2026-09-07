@@ -1,0 +1,90 @@
+{{define "content"}}
+{{if .Message}}<div class="msg">{{.Message}}</div>{{end}}
+
+<div class="tiles">
+  {{range .Tiles}}
+  <div class="tile {{.Status}}">
+    <div class="label">{{.Label}}</div>
+    <div class="value">{{.Value}}</div>
+    <div class="note">{{.Note}}</div>
+  </div>
+  {{end}}
+</div>
+
+{{if .Orphans}}
+<h2>Orphan registrations</h2>
+<p class="sub">Bot Users whose claimed login has no collection — usually a typo at <code>/deckbox</code>. Search can never return them.</p>
+<div class="scroll">
+<table>
+  <thead><tr><th>Login claimed</th><th>Telegram</th><th></th></tr></thead>
+  <tbody>
+  {{range .Orphans}}
+    <tr>
+      <td>{{.DeckboxLogin}}</td>
+      <td class="muted">{{if .TelegramUsername}}@{{.TelegramUsername}}{{else}}id {{.TelegramID}}{{end}}</td>
+      <td>
+        <form class="inline" method="post" action="/add">
+          <input type="hidden" name="login" value="{{.DeckboxLogin}}">
+          <button type="submit">Try scraping it</button>
+        </form>
+        <form class="inline" method="post" action="/unlink">
+          <input type="hidden" name="login" value="{{.DeckboxLogin}}">
+          <button type="submit" class="danger">Unlink</button>
+        </form>
+      </td>
+    </tr>
+  {{end}}
+  </tbody>
+</table>
+</div>
+{{end}}
+
+<h2>Add a Deckbox login</h2>
+<p class="sub">Scrapes the profile and all three lists immediately, the same path <code>/suggestdeckbox</code> uses. Takes a few seconds.</p>
+<form method="post" action="/add">
+  <input type="text" name="login" placeholder="deckbox login" required autocomplete="off">
+  <button type="submit">Add &amp; scrape</button>
+</form>
+
+<h2>Deckbox Users</h2>
+<p class="sub">Card counts are rows per list. Purge removes the collection, its cards and any registration; Unlink keeps the collection.</p>
+{{if not .Users}}
+<p class="muted">No collections tracked yet.</p>
+{{else}}
+<div class="scroll">
+<table>
+  <thead>
+    <tr>
+      <th>Login</th><th>Telegram</th>
+      <th class="num">Inventory</th><th class="num">Tradelist</th><th class="num">Wishlist</th>
+      <th>Refreshed</th><th>Last error</th><th>Actions</th>
+    </tr>
+  </thead>
+  <tbody>
+  {{range .Users}}
+    <tr>
+      <td>{{.Login}}{{if .Missing}} <span class="warn-text" title="{{.Missing}} of 3 lists absent or empty">·{{.Missing}}</span>{{end}}</td>
+      <td class="muted">{{.Telegram}}</td>
+      <td class="num">{{.Inventory}}</td>
+      <td class="num">{{.Tradelist}}</td>
+      <td class="num">{{.Wishlist}}</td>
+      <td {{if .Stale}}class="warn-text"{{end}}>{{.Age}}</td>
+      <td class="err">{{.LastError}}</td>
+      <td>
+        <form class="inline" method="post" action="/refresh">
+          <input type="hidden" name="login" value="{{.Login}}">
+          <button type="submit">Refresh</button>
+        </form>
+        <form class="inline" method="post" action="/unlink">
+          <input type="hidden" name="login" value="{{.Login}}">
+          <button type="submit">Unlink</button>
+        </form>
+        <a class="btn danger" href="/purge?login={{.Login}}">Purge…</a>
+      </td>
+    </tr>
+  {{end}}
+  </tbody>
+</table>
+</div>
+{{end}}
+{{end}}

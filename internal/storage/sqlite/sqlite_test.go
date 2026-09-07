@@ -692,9 +692,9 @@ func TestGetDeckboxUser(t *testing.T) {
 	})
 }
 
-// --- UpdateDeckboxUserTimestamp ---
+// --- SaveRefreshOutcome ---
 
-func TestUpdateDeckboxUserTimestamp(t *testing.T) {
+func TestSaveRefreshOutcomeStampsTimestamp(t *testing.T) {
 	ctx := context.Background()
 	s := newTestDB(t)
 
@@ -710,7 +710,9 @@ func TestUpdateDeckboxUserTimestamp(t *testing.T) {
 	}
 
 	ts := time.Now().Unix()
-	if err := s.UpdateDeckboxUserTimestamp(ctx, "dave", ts); err != nil {
+	if err := s.SaveRefreshOutcome(ctx, deckbox.RefreshOutcome{
+		DeckboxLogin: "dave", CardCount: 12, UpdatedAt: &ts,
+	}); err != nil {
 		t.Fatalf("update failed: %v", err)
 	}
 
@@ -734,7 +736,9 @@ func TestGetAllDeckboxUsersWithOldLists(t *testing.T) {
 			t.Fatalf("save %s: %v", login, err)
 		}
 		if updatedAt != nil {
-			if err := s.UpdateDeckboxUserTimestamp(ctx, login, *updatedAt); err != nil {
+			if err := s.SaveRefreshOutcome(ctx, deckbox.RefreshOutcome{
+				DeckboxLogin: login, UpdatedAt: updatedAt,
+			}); err != nil {
 				t.Fatalf("timestamp %s: %v", login, err)
 			}
 		}

@@ -27,12 +27,14 @@ FTS5 tests skip automatically when the driver lacks FTS5 support. Scraper integr
 ```
 main.go                      Bot setup, handler registration, Telegram plumbing
 internal/
+  admin/                     Admin Panel: net/http + embedded html/template (manage + insights)
   config/config.go           .env loading (MustLoad panics on missing required vars)
   deckbox/
     deckbox.go               Domain types + Query/SearchResult + DeckboxSaver interface
     scrapper.go              net/http + goquery scraper (shared keep-alive client) + Deckbox login/cookie auth
     handler.go               Deckbox receiver: Register, Search, RefreshStale, Suggest
   storage/sqlite/sqlite.go   SQLite implementation of DeckboxSaver
+  storage/sqlite/admin.go    Purge/Unlink, Demand counters, panel queries
   telegram/render.go         Search results → Telegram HTML; CommandArgument
   i18n/i18n.go               RU/EN translations via T(lang, key)
   lib/logger/sl/sl.go        sl.Err(err) helper for slog
@@ -47,6 +49,15 @@ env/env.go                   EnvKey type + godotenv Load()
 2. **Registration** (`/deckbox <login>`): `Register` → `RegisterUser` → background refresh through the **same** worker pool every other caller uses (1 worker, 2-minute timeout), so registration also stamps `updated_at`
 3. **Batch refresh** (`/suggestdeckbox <logins>`): 5-worker pool with a freshness pre-filter
 4. **Wishlist search** (`/sell`): identical to card search with `ScopeWishlist`
+5. **Admin Panel** (`/` and `/insights` over HTTP): `internal/admin` → `Deckbox` (`Purge`, `Unlink`, `RefreshNow`, `AdminOverview`/`AdminUsers`/`AdminInsights`) → `DeckboxSaver`. It never touches storage directly — `Purge` must go through `Deckbox` so the `savedHashes` entries for the deleted lists are dropped, or a re-registration of the same login would be skipped as unchanged and stay empty
+
+### Admin Panel
+
+Runs in the bot process, listens on `ADMIN_ADDR` (default `:8081`), and publishes **no** port: a Caddy sidecar terminates TLS for `admin.ivash.net` and proxies to it over the compose network, so there is no route that bypasses TLS and auth. HTTP Basic Auth (`ADMIN_USER`/`ADMIN_PASSWORD`, `subtle.ConstantTimeCompare`, one-second sleep on failure); the panel refuses to start when `ADMIN_PASSWORD` is empty. Mutating routes are POST-only and rejected unless `Sec-Fetch-Site` is `same-origin` (Basic Auth makes CSRF worse, not better — the browser re-sends credentials automatically). Purge is confirmed by a `GET /purge?login=` page rather than a JS dialog, which keeps the CSP at `default-src 'none'`. Analytics are memoized for 5 minutes because three of their queries scan `card_lists`. See `docs/adr/0003`.
+
+### Demand
+
+`search_stats(term, scope, display, hits, misses, last_seen)` counts searches per canonicalized Search Term — not per matched card, since a miss matched none. `daily_stats(day, searches, misses)` is the time series; registrations per day come from `users.created_at`. `list_snapshots(listId, day, cardCount)` samples list sizes, which `card_lists` cannot show because it is replace-in-place. `deckbox_users.last_error`/`last_card_count` record refresh outcomes that previously only reached stdout. Writes are fire-and-forget from `Search` so a counter never queues behind a refresh on the single write connection. See `docs/adr/0004`.
 
 ### Storage design
 
@@ -102,12 +113,16 @@ All profile/export fetches go through one shared `http.Transport` (keep-alive, 1
 | `FRESHNESS_TIME_LIMIT_HOURS` | no   | 24      | Hours before `Suggest` treats data as stale                                   |
 | `CARD_LIST_REFRESH_HOURS` | no      | 3       | Hours before auto-refresh triggers on search                                  |
 | `CARD_LIST_BATCH_SIZE`   | no       | 1000    | Cards per INSERT batch (read in `sqlite.go`, not `config.go`)                 |
+| `ADMIN_ADDR`             | no       | `:8081` | Admin Panel listen address inside the container (never published to the host) |
+| `ADMIN_USER`             | no       | `admin` | Admin Panel Basic Auth user                                                   |
+| `ADMIN_PASSWORD`         | no       | —       | Admin Panel Basic Auth password; **empty disables the panel**                 |
+| `ADMIN_DOMAIN`           | no       | `admin.ivash.net` | Read by the Caddyfile, not the bot; the panel's public hostname     |
 
 \* Auth requires **either** `DECKBOX_LOGIN`+`DECKBOX_PASSWORD` **or** `DECKBOX_SESSION_COOKIE`; `MustLoad` fatals if neither is present.
 
 ## CI/CD
 
-GitHub Actions on push to `main`: `go test -tags fts5 -race ./...` → build+push image to `ghcr.io/crazyfen/friendlycardfinder` → SCP `docker-compose.yml` to VPS → `docker compose pull && up -d`. Secrets: `SSH_HOST`, `SSH_USER`, `SSH_PRIVATE_KEY`. VPS `.env` is maintained manually at `~/friendlycardfinder/`.
+GitHub Actions on push to `main`: `go test -tags fts5 -race ./...` → build+push image to `ghcr.io/crazyfen/friendlycardfinder` → SCP `docker-compose.yml` + `Caddyfile` to VPS → `docker compose pull && up -d`. Secrets: `SSH_HOST`, `SSH_USER`, `SSH_PRIVATE_KEY`. VPS `.env` is maintained manually at `~/friendlycardfinder/`.
 
 ## graphify
 

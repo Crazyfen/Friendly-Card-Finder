@@ -112,16 +112,17 @@ func (d *Deckbox) refreshUser(ctx context.Context, log *slog.Logger, login strin
 	user, err := d.scraper.FetchDeckboxUserProfile(ctx, login)
 	if err != nil {
 		log.Error("failed to fetch user profile", sl.Err(err))
-		return 0, fmt.Sprintf("failed to fetch profile: %v", err)
+		return 0, d.recordFailure(ctx, log, login, fmt.Sprintf("failed to fetch profile: %v", err))
 	}
 
 	err = d.storage.SaveDeckboxUser(ctx, user)
 	if err != nil {
 		log.Error("failed to save deckbox user", sl.Err(err))
-		return 0, fmt.Sprintf("failed to save user: %v", err)
+		return 0, d.recordFailure(ctx, log, login, fmt.Sprintf("failed to save user: %v", err))
 	}
 
 	totalCards := 0
+	var sizes []ListSize
 
 	for _, l := range []struct {
 		name string
@@ -141,22 +142,36 @@ func (d *Deckbox) refreshUser(ctx context.Context, log *slog.Logger, login strin
 		}
 		if d.saveCardListIfChanged(ctx, log, cardList) {
 			totalCards += len(cardList.Cards)
+			sizes = append(sizes, ListSize{ListId: cardList.ListId, CardCount: len(cardList.Cards)})
 		}
 	}
 
-	// Update timestamp only if card list saves succeeded
-	if totalCards > 0 {
-		err = d.storage.UpdateDeckboxUserTimestamp(ctx, login, time.Now().Unix())
-		if err != nil {
-			log.Error("failed to update timestamp", sl.Err(err))
-			return 0, fmt.Sprintf("failed to update timestamp: %v", err)
-		}
-	} else {
+	// One write records the outcome and the day's list sizes together. A failed
+	// refresh deliberately leaves updated_at alone so the user stays stale and
+	// the ticker retries them — but its error still has to reach the panel.
+	outcome := RefreshOutcome{DeckboxLogin: login, CardCount: totalCards, Lists: sizes}
+	if totalCards == 0 {
 		// No cards processed indicates possible errors fetching/saving lists
-		return 0, "failed to refresh lists or no cards found"
+		return 0, d.recordFailure(ctx, log, login, "failed to refresh lists or no cards found")
+	}
+
+	now := time.Now().Unix()
+	outcome.UpdatedAt = &now
+	if err := d.storage.SaveRefreshOutcome(ctx, outcome); err != nil {
+		log.Error("failed to save refresh outcome", sl.Err(err))
+		return 0, fmt.Sprintf("failed to update timestamp: %v", err)
 	}
 
 	return totalCards, ""
+}
+
+// recordFailure stores why a Refresh failed and echoes the message back, so the
+// Admin Panel can show what the logs used to be the only record of.
+func (d *Deckbox) recordFailure(ctx context.Context, log *slog.Logger, login, msg string) string {
+	if err := d.storage.SaveRefreshOutcome(ctx, RefreshOutcome{DeckboxLogin: login, Err: msg}); err != nil {
+		log.Warn("failed to record refresh failure", sl.Err(err))
+	}
+	return msg
 }
 
 type refreshResult struct {
@@ -383,6 +398,8 @@ func (d *Deckbox) Search(ctx context.Context, cardNames []string, scope string) 
 			return SearchResult{}, err
 		}
 	}
+
+	d.recordDemand(ctx, log, queries, matches)
 
 	for i, name := range names {
 		if len(matches[i]) == 0 {

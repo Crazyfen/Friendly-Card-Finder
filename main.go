@@ -1,6 +1,7 @@
 package main
 
 import (
+	"FriendlyCardFinder/internal/admin"
 	"FriendlyCardFinder/internal/config"
 	"FriendlyCardFinder/internal/deckbox"
 	"FriendlyCardFinder/internal/i18n"
@@ -97,6 +98,22 @@ func main() {
 			}
 		}
 	}()
+
+	// Admin Panel. It refuses to start without a password rather than exposing a
+	// purge endpoint openly, so a missing ADMIN_PASSWORD disables it loudly.
+	if panel, err := admin.New(log, app.dbx, admin.Config{
+		Addr:     cfg.AdminAddr,
+		User:     cfg.AdminUser,
+		Password: cfg.AdminPassword,
+	}); err != nil {
+		log.Warn("admin panel disabled", sl.Err(err))
+	} else {
+		go func() {
+			if err := panel.ListenAndServe(ctx); err != nil {
+				log.Error("admin panel failed", sl.Err(err))
+			}
+		}()
+	}
 
 	opts := []bot.Option{
 		bot.WithDefaultHandler(app.defaultHandler),
