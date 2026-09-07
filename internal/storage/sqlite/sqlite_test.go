@@ -25,6 +25,24 @@ func newTestDB(t *testing.T) *SQLiteStorage {
 	return s
 }
 
+// searchCards runs one search and flattens the grouped results into a single
+// cardName -> quantity map, so tests can assert on matched cards rather than on
+// the Card List groups SearchCard returns.
+func searchCards(t testing.TB, s *SQLiteStorage, ctx context.Context, name, scope string, exact bool) map[string]int16 {
+	t.Helper()
+	results, err := s.SearchCard(ctx, deckbox.Query{Name: name, Scope: scope, Exact: exact})
+	if err != nil {
+		t.Fatalf("search %q failed: %v", name, err)
+	}
+	all := make(map[string]int16)
+	for _, r := range results {
+		for cardName, qty := range r.Cards {
+			all[cardName] += qty
+		}
+	}
+	return all
+}
+
 // Benchmarking notes:
 //
 // 1) Run benchmarks (baseline):
@@ -96,15 +114,14 @@ func TestFtsSchemaUpgrade(t *testing.T) {
 	}
 
 	for name, wantQty := range map[string]int16{"Lightning Bolt": 4, "Smeagol": 2} {
-		results, err := s2.SearchCard(ctx, name, deckbox.ScopeTradelist, false)
-		if err != nil {
-			t.Fatalf("search %q failed: %v", name, err)
+		cards := searchCards(t, s2, ctx, name, deckbox.ScopeTradelist, false)
+		if len(cards) != 1 {
+			t.Fatalf("search %q: got %d matched cards, want 1", name, len(cards))
 		}
-		if len(results) != 1 {
-			t.Fatalf("search %q: got %d results, want 1", name, len(results))
-		}
-		if results[0].Quantity != wantQty {
-			t.Errorf("search %q: got quantity %d, want %d", name, results[0].Quantity, wantQty)
+		for matched, qty := range cards {
+			if qty != wantQty {
+				t.Errorf("search %q matched %q: got quantity %d, want %d", name, matched, qty, wantQty)
+			}
 		}
 	}
 }
@@ -156,10 +173,7 @@ func TestSaveCardListWithLargeCollection(t *testing.T) {
 	}
 
 	// Verify the cards were actually saved
-	results, err := storage.SearchCard(ctx, "Card_", deckbox.ScopeTradelist, false)
-	if err != nil {
-		t.Fatalf("failed to search for cards: %v", err)
-	}
+	results := searchCards(t, storage, ctx, "Card_", deckbox.ScopeTradelist, false)
 
 	if len(results) == 0 {
 		t.Fatal("expected cards to be saved but found none")
@@ -231,10 +245,7 @@ func TestSaveCardListBatching(t *testing.T) {
 
 			// Verify count matches
 			if tt.cardCount > 0 {
-				results, err := storage.SearchCard(ctx, "Card_", deckbox.ScopeTradelist, false)
-				if err != nil {
-					t.Fatalf("failed to search: %v", err)
-				}
+				results := searchCards(t, storage, ctx, "Card_", deckbox.ScopeTradelist, false)
 				if len(results) != tt.cardCount {
 					t.Errorf("expected %d cards, got %d", tt.cardCount, len(results))
 				}
@@ -283,7 +294,7 @@ func TestSaveCardListTransactionRollback(t *testing.T) {
 	}
 
 	// Verify first save worked
-	results1, _ := storage.SearchCard(ctx, "ValidCard_", deckbox.ScopeTradelist, false)
+	results1 := searchCards(t, storage, ctx, "ValidCard_", deckbox.ScopeTradelist, false)
 	if len(results1) != 2 {
 		t.Fatalf("expected 2 cards from first save, got %d", len(results1))
 	}
@@ -303,8 +314,8 @@ func TestSaveCardListTransactionRollback(t *testing.T) {
 	}
 
 	// Verify second save replaced the old cards
-	results2, _ := storage.SearchCard(ctx, "NewCard_", deckbox.ScopeTradelist, false)
-	oldResults, _ := storage.SearchCard(ctx, "ValidCard_", deckbox.ScopeTradelist, false)
+	results2 := searchCards(t, storage, ctx, "NewCard_", deckbox.ScopeTradelist, false)
+	oldResults := searchCards(t, storage, ctx, "ValidCard_", deckbox.ScopeTradelist, false)
 
 	if len(results2) != 3 {
 		t.Errorf("expected 3 new cards, got %d", len(results2))
@@ -356,20 +367,13 @@ func TestSearchCardWithFTS(t *testing.T) {
 	}
 
 	// Search for 'shock' should match both 'Shock' and 'Shocking Grasp'
-	results, err := storage.SearchCard(ctx, "shock", deckbox.ScopeTradelist, false)
-	if err != nil {
-		t.Fatalf("search failed: %v", err)
-	}
-
+	results := searchCards(t, storage, ctx, "shock", deckbox.ScopeTradelist, false)
 	if len(results) < 2 {
 		t.Fatalf("expected at least 2 results for 'shock', got %d", len(results))
 	}
 
 	// Search for 'lightning' should match both Lightning cards
-	results2, err := storage.SearchCard(ctx, "lightning", deckbox.ScopeTradelist, false)
-	if err != nil {
-		t.Fatalf("search failed: %v", err)
-	}
+	results2 := searchCards(t, storage, ctx, "lightning", deckbox.ScopeTradelist, false)
 	if len(results2) < 2 {
 		t.Fatalf("expected at least 2 results for 'lightning', got %d", len(results2))
 	}
@@ -386,10 +390,7 @@ func TestSearchCardWithFTS(t *testing.T) {
 		t.Fatalf("failed to save hyphenated card list: %v", err)
 	}
 
-	results3, err := storage.SearchCard(ctx, "Vitu-Ghazi Inspector", deckbox.ScopeTradelist, false)
-	if err != nil {
-		t.Fatalf("search failed for hyphenated name: %v", err)
-	}
+	results3 := searchCards(t, storage, ctx, "Vitu-Ghazi Inspector", deckbox.ScopeTradelist, false)
 	if len(results3) < 1 {
 		t.Fatalf("expected at least 1 result for 'Vitu-Ghazi Inspector', got %d", len(results3))
 	}
@@ -405,10 +406,7 @@ func TestSearchCardWithFTS(t *testing.T) {
 		t.Fatalf("failed to save accented card list: %v", err)
 	}
 
-	results4, err := storage.SearchCard(ctx, "smeagol", deckbox.ScopeTradelist, false)
-	if err != nil {
-		t.Fatalf("search failed for accented name: %v", err)
-	}
+	results4 := searchCards(t, storage, ctx, "smeagol", deckbox.ScopeTradelist, false)
 	if len(results4) < 1 {
 		t.Fatalf("expected at least 1 result for 'smeagol', got %d", len(results4))
 	}
@@ -424,13 +422,82 @@ func TestSearchCardWithFTS(t *testing.T) {
 		t.Fatalf("failed to save split card list: %v", err)
 	}
 
-	results5, err := storage.SearchCard(ctx, "//", deckbox.ScopeTradelist, false)
-	if err != nil {
-		t.Fatalf("search failed for split card name: %v", err)
-	}
-
+	results5 := searchCards(t, storage, ctx, "//", deckbox.ScopeTradelist, false)
 	if len(results5) < 1 {
 		t.Fatalf("expected at least 1 result for 'Umara Skyfalls', got %d", len(results5))
+	}
+}
+
+// TestSearchCardGroupsByOwner covers the grouping SearchCard does behind the
+// seam: one entry per Card List, carrying its owner and every matched card.
+func TestSearchCardGroupsByOwner(t *testing.T) {
+	ctx := context.Background()
+	storage := newTestDB(t)
+
+	aliceList, bobList := int64(8001), int64(8002)
+	if err := storage.SaveDeckboxUser(ctx, deckbox.DeckboxUser{DeckboxLogin: "alice", TradelistID: &aliceList}); err != nil {
+		t.Fatalf("failed to save alice: %v", err)
+	}
+	if err := storage.SaveDeckboxUser(ctx, deckbox.DeckboxUser{DeckboxLogin: "bob", TradelistID: &bobList}); err != nil {
+		t.Fatalf("failed to save bob: %v", err)
+	}
+	if err := storage.RegisterUser(ctx, deckbox.BotUser{TelegramID: 42, TelegramUsername: "alice_tg", DeckboxLogin: "alice"}); err != nil {
+		t.Fatalf("failed to register alice: %v", err)
+	}
+	if err := storage.SaveCardList(ctx, deckbox.CardList{
+		ListId: aliceList,
+		Cards:  map[string]int16{"Lightning Bolt": 4, "Lightning Helix": 1},
+	}); err != nil {
+		t.Fatalf("failed to save alice's list: %v", err)
+	}
+	if err := storage.SaveCardList(ctx, deckbox.CardList{
+		ListId: bobList,
+		Cards:  map[string]int16{"Lightning Bolt": 2},
+	}); err != nil {
+		t.Fatalf("failed to save bob's list: %v", err)
+	}
+
+	results, err := storage.SearchCard(ctx, deckbox.Query{Name: "Lightning", Scope: deckbox.ScopeTradelist})
+	if err != nil {
+		t.Fatalf("search failed: %v", err)
+	}
+	if len(results) != 2 {
+		t.Fatalf("expected one group per Card List, got %d", len(results))
+	}
+
+	byLogin := make(map[string]deckbox.CardListWithOwner, len(results))
+	for _, r := range results {
+		byLogin[r.DeckboxLogin] = r
+	}
+
+	alice, ok := byLogin["alice"]
+	if !ok {
+		t.Fatalf("expected a group for alice, got %v", results)
+	}
+	if len(alice.Cards) != 2 || alice.Cards["Lightning Bolt"] != 4 || alice.Cards["Lightning Helix"] != 1 {
+		t.Errorf("alice's group: want both Lightning cards with their quantities, got %v", alice.Cards)
+	}
+	if alice.ListId != aliceList {
+		t.Errorf("alice's group: want listId %d, got %d", aliceList, alice.ListId)
+	}
+	// A registered Bot User's Telegram identity rides along on the group.
+	if alice.TelegramID == nil || *alice.TelegramID != 42 {
+		t.Errorf("alice's group: want telegram id 42, got %v", alice.TelegramID)
+	}
+	if alice.TelegramUsername == nil || *alice.TelegramUsername != "alice_tg" {
+		t.Errorf("alice's group: want telegram username, got %v", alice.TelegramUsername)
+	}
+
+	bob, ok := byLogin["bob"]
+	if !ok {
+		t.Fatalf("expected a group for bob, got %v", results)
+	}
+	if len(bob.Cards) != 1 || bob.Cards["Lightning Bolt"] != 2 {
+		t.Errorf("bob's group: want Lightning Bolt=2, got %v", bob.Cards)
+	}
+	// Bob never registered with the bot, so there is no Telegram identity.
+	if bob.TelegramID != nil || bob.TelegramUsername != nil {
+		t.Errorf("bob's group: want no telegram identity, got %v/%v", bob.TelegramID, bob.TelegramUsername)
 	}
 }
 
@@ -488,13 +555,10 @@ func TestSearchCardExact(t *testing.T) {
 
 			for _, tt := range tests {
 				t.Run(tt.name, func(t *testing.T) {
-					results, err := storage.SearchCard(ctx, tt.query, deckbox.ScopeTradelist, true)
-					if err != nil {
-						t.Fatalf("exact search %q failed: %v", tt.query, err)
-					}
-					got := make([]string, 0, len(results))
-					for _, r := range results {
-						got = append(got, r.CardName)
+					matched := searchCards(t, storage, ctx, tt.query, deckbox.ScopeTradelist, true)
+					got := make([]string, 0, len(matched))
+					for cardName := range matched {
+						got = append(got, cardName)
 					}
 					sort.Strings(got)
 					want := append([]string(nil), tt.wantNames...)
@@ -542,19 +606,13 @@ func TestSearchCardWishlist(t *testing.T) {
 	}
 
 	// Search in wishlist scope - should find
-	res, err := storage.SearchCard(ctx, "WishCard", deckbox.ScopeWishlist, false)
-	if err != nil {
-		t.Fatalf("search failed: %v", err)
-	}
+	res := searchCards(t, storage, ctx, "WishCard", deckbox.ScopeWishlist, false)
 	if len(res) == 0 {
 		t.Fatalf("expected wishlist search to find results")
 	}
 
 	// Search in tradelist scope - should NOT find
-	res2, err := storage.SearchCard(ctx, "WishCard", deckbox.ScopeTradelist, false)
-	if err != nil {
-		t.Fatalf("search failed: %v", err)
-	}
+	res2 := searchCards(t, storage, ctx, "WishCard", deckbox.ScopeTradelist, false)
 	if len(res2) != 0 {
 		t.Fatalf("expected no tradelist results for wishlist card, got %d", len(res2))
 	}
@@ -748,96 +806,6 @@ func TestGetAllDeckboxUsersWithOldLists(t *testing.T) {
 	}
 }
 
-// --- ClearCardList ---
-
-func TestClearCardList(t *testing.T) {
-	ctx := context.Background()
-	s := newTestDB(t)
-
-	listID := int64(55)
-	tl := listID
-	if err := s.SaveDeckboxUser(ctx, deckbox.DeckboxUser{DeckboxLogin: "eve", TradelistID: &tl}); err != nil {
-		t.Fatalf("save user: %v", err)
-	}
-	if err := s.SaveCardList(ctx, deckbox.CardList{ListId: listID, Cards: map[string]int16{"Bolt": 4}}); err != nil {
-		t.Fatalf("save list: %v", err)
-	}
-
-	results, _ := s.SearchCard(ctx, "Bolt", deckbox.ScopeTradelist, false)
-	if len(results) == 0 {
-		t.Fatal("expected card before clear")
-	}
-
-	if err := s.ClearCardList(ctx, listID); err != nil {
-		t.Fatalf("clear failed: %v", err)
-	}
-
-	results, _ = s.SearchCard(ctx, "Bolt", deckbox.ScopeTradelist, false)
-	if len(results) != 0 {
-		t.Fatalf("expected 0 results after clear, got %d", len(results))
-	}
-}
-
-// --- GetOwnerByListId ---
-
-func TestGetOwnerByListId(t *testing.T) {
-	ctx := context.Background()
-
-	t.Run("deckbox user only (no telegram user)", func(t *testing.T) {
-		s := newTestDB(t)
-		tl := int64(100)
-		if err := s.SaveDeckboxUser(ctx, deckbox.DeckboxUser{DeckboxLogin: "frank", TradelistID: &tl}); err != nil {
-			t.Fatalf("save failed: %v", err)
-		}
-		info, err := s.GetOwnerByListId(ctx, tl)
-		if err != nil {
-			t.Fatalf("unexpected error: %v", err)
-		}
-		if info == nil {
-			t.Fatal("expected owner info, got nil")
-		}
-		if info.DeckboxLogin != "frank" {
-			t.Errorf("expected 'frank', got %q", info.DeckboxLogin)
-		}
-		// No telegram user registered → both fields nil
-		if info.TelegramID != nil || info.TelegramUsername != nil {
-			t.Errorf("expected nil telegram fields, got id=%v username=%v", info.TelegramID, info.TelegramUsername)
-		}
-	})
-
-	t.Run("with registered telegram user", func(t *testing.T) {
-		s := newTestDB(t)
-		tl := int64(200)
-		if err := s.SaveDeckboxUser(ctx, deckbox.DeckboxUser{DeckboxLogin: "grace", TradelistID: &tl}); err != nil {
-			t.Fatalf("save deckbox user: %v", err)
-		}
-		if err := s.RegisterUser(ctx, deckbox.BotUser{TelegramID: 9001, TelegramUsername: "grace_tg", DeckboxLogin: "grace"}); err != nil {
-			t.Fatalf("register telegram user: %v", err)
-		}
-		info, err := s.GetOwnerByListId(ctx, tl)
-		if err != nil {
-			t.Fatalf("unexpected error: %v", err)
-		}
-		if info.TelegramID == nil || *info.TelegramID != 9001 {
-			t.Errorf("expected TelegramID=9001, got %v", info.TelegramID)
-		}
-		if info.TelegramUsername == nil || *info.TelegramUsername != "grace_tg" {
-			t.Errorf("expected TelegramUsername='grace_tg', got %v", info.TelegramUsername)
-		}
-	})
-
-	t.Run("unknown list id returns error", func(t *testing.T) {
-		s := newTestDB(t)
-		info, err := s.GetOwnerByListId(ctx, 99999)
-		if err == nil {
-			t.Fatal("expected error for unknown list id, got nil")
-		}
-		if info != nil {
-			t.Fatalf("expected nil info on error, got %+v", info)
-		}
-	})
-}
-
 func BenchmarkSaveCardList(b *testing.B) {
 	// Silence slog output to keep benchmark output clean.
 	oldLogger := slog.Default()
@@ -923,7 +891,7 @@ func benchmarkSearchCard(b *testing.B, wantFTS bool) {
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		if _, err := storage.SearchCard(ctx, "Card_", deckbox.ScopeTradelist, false); err != nil {
+		if _, err := storage.SearchCard(ctx, deckbox.Query{Name: "Card_", Scope: deckbox.ScopeTradelist}); err != nil {
 			b.Fatalf("search failed: %v", err)
 		}
 	}

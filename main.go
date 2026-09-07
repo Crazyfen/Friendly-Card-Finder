@@ -7,6 +7,7 @@ import (
 	"FriendlyCardFinder/internal/lib/logger/sl"
 	"FriendlyCardFinder/internal/lib/tgutil"
 	"FriendlyCardFinder/internal/storage/sqlite"
+	"FriendlyCardFinder/internal/telegram"
 	"context"
 	"fmt"
 	"log/slog"
@@ -25,10 +26,8 @@ import (
 )
 
 type App struct {
-	log     *slog.Logger
-	storage deckbox.DeckboxSaver
-	scraper *deckbox.Scraper
-	cfg     *config.Config
+	log *slog.Logger
+	dbx *deckbox.Deckbox
 }
 
 const (
@@ -71,28 +70,28 @@ func main() {
 		}
 	}()
 
+	scraper := deckbox.NewScraper(log, deckbox.ScraperAuth{
+		Login:          cfg.DeckboxLogin,
+		Password:       cfg.DeckboxPassword,
+		CookieOverride: cfg.DeckboxSessionCookie,
+		CookiePath:     cfg.DeckboxCookiePath,
+	})
+
 	app := &App{
-		log:     log,
-		storage: storage,
-		scraper: deckbox.NewScraper(log, deckbox.ScraperAuth{
-			Login:          cfg.DeckboxLogin,
-			Password:       cfg.DeckboxPassword,
-			CookieOverride: cfg.DeckboxSessionCookie,
-			CookiePath:     cfg.DeckboxCookiePath,
-		}),
-		cfg:     cfg,
+		log: log,
+		dbx: deckbox.New(log, storage, scraper, cfg.CardListRefreshHours, cfg.FreshnessTimeLimitHours),
 	}
 
 	// Background refresh: runs immediately at startup then on a ticker so searches
 	// are never blocked waiting for stale lists to refresh.
 	go func() {
-		deckbox.RefreshStaleUserLists(ctx, app.log, app.storage, app.scraper, app.cfg.CardListRefreshHours)
+		app.dbx.RefreshStale(ctx)
 		ticker := time.NewTicker(time.Duration(30) * time.Second)
 		defer ticker.Stop()
 		for {
 			select {
 			case <-ticker.C:
-				deckbox.RefreshStaleUserLists(ctx, app.log, app.storage, app.scraper, app.cfg.CardListRefreshHours)
+				app.dbx.RefreshStale(ctx)
 			case <-ctx.Done():
 				return
 			}
@@ -160,7 +159,7 @@ func (a *App) deckboxHandler(ctx context.Context, b *bot.Bot, update *models.Upd
 	log.Info("handling /deckbox command")
 
 	lang := i18n.DetectLang(update.Message.From.LanguageCode)
-	response := deckbox.NewUser(ctx, log, a.storage, a.scraper, update.Message, lang)
+	response := a.register(ctx, log, update.Message, lang)
 
 	_, err := b.SendMessage(ctx, &bot.SendMessageParams{
 		ChatID: update.Message.Chat.ID,
@@ -171,12 +170,33 @@ func (a *App) deckboxHandler(ctx context.Context, b *bot.Bot, update *models.Upd
 	}
 }
 
+// register turns a /deckbox message into a Registration and reports the outcome
+// in the user's language.
+func (a *App) register(ctx context.Context, log *slog.Logger, message *models.Message, lang string) string {
+	login := telegram.CommandArgument(message)
+	if login == "" {
+		log.Info("forgotten deckbox login")
+		return i18n.T(lang, "deckbox.register_no_argument")
+	}
+
+	err := a.dbx.Register(ctx, deckbox.Registration{
+		TelegramID:       message.From.ID,
+		TelegramUsername: message.From.Username,
+		DeckboxLogin:     login,
+	})
+	if err != nil {
+		return i18n.T(lang, "deckbox.register_error")
+	}
+
+	return fmt.Sprintf(i18n.T(lang, "deckbox.register_success"), message.From.FirstName, message.From.LastName)
+}
+
 func (a *App) suggestdeckboxHandler(ctx context.Context, b *bot.Bot, update *models.Update) {
 	const op = "handlers.suggestdeckboxHandler"
 	log := a.log.With(slog.String("operation", op), slog.String("message_id", strconv.Itoa(update.Message.ID)))
 	log.Info("handling /suggestdeckbox command")
 
-	argument := deckbox.NewCommandArguments(update.Message)
+	argument := telegram.CommandArgument(update.Message)
 	lang := i18n.DetectLang(update.Message.From.LanguageCode)
 	if argument == "" {
 		_, err := b.SendMessage(ctx, &bot.SendMessageParams{
@@ -192,7 +212,7 @@ func (a *App) suggestdeckboxHandler(ctx context.Context, b *bot.Bot, update *mod
 	logins := strings.Split(argument, "\n")
 
 	go func() {
-		result := deckbox.SuggestDeckbox(ctx, log, a.storage, a.scraper, logins, a.cfg.FreshnessTimeLimitHours)
+		result := a.dbx.Suggest(ctx, logins)
 
 		var response strings.Builder
 		response.WriteString(fmt.Sprintf(i18n.T(lang, "suggest.summary"),
@@ -232,7 +252,7 @@ func (a *App) sellHandler(ctx context.Context, b *bot.Bot, update *models.Update
 	log := a.log.With(slog.String("operation", op), slog.String("message_id", strconv.Itoa(update.Message.ID)))
 	log.Info("handling /sell command")
 
-	argument := deckbox.NewCommandArguments(update.Message)
+	argument := telegram.CommandArgument(update.Message)
 	lang := i18n.DetectLang(update.Message.From.LanguageCode)
 	if argument == "" {
 		_, err := b.SendMessage(ctx, &bot.SendMessageParams{
@@ -248,8 +268,8 @@ func (a *App) sellHandler(ctx context.Context, b *bot.Bot, update *models.Update
 	a.searchAndReply(ctx, b, log, lang, argument, update.Message.Chat.ID, int(update.Message.ID), deckbox.ScopeWishlist)
 }
 
-// searchAndReply parses one-card-per-line input and replies either with the
-// single-card format (1 card) or the grouped multi-card format (>1 cards).
+// searchAndReply parses one-card-per-line input, searches, and sends the
+// rendered result (plus a not-found message when one is produced).
 func (a *App) searchAndReply(ctx context.Context, b *bot.Bot, log *slog.Logger, lang, text string, chatID int64, replyToID int, scope string) {
 	var cards []string
 	for line := range strings.SplitSeq(text, "\n") {
@@ -262,22 +282,13 @@ func (a *App) searchAndReply(ctx context.Context, b *bot.Bot, log *slog.Logger, 
 		return
 	}
 
-	if len(cards) == 1 {
-		result, err := deckbox.SearchCard(ctx, log, a.storage, cards[0], scope)
-		if err != nil {
-			log.Error("failed to search card", sl.Err(err))
-			return
-		}
-		sendHTMLReply(ctx, b, chatID, replyToID, result.FormatForTelegram(lang, scope), log)
-		return
-	}
-
-	result, err := deckbox.SearchCards(ctx, log, a.storage, cards, scope)
+	result, err := a.dbx.Search(ctx, cards, scope)
 	if err != nil {
 		log.Error("failed to search cards", sl.Err(err))
 		return
 	}
-	mainMsg, notFoundMsg := result.FormatForTelegram(lang, scope)
+
+	mainMsg, notFoundMsg := telegram.RenderSearch(result, lang, scope)
 	sendHTMLReply(ctx, b, chatID, replyToID, mainMsg, log)
 	if notFoundMsg != "" {
 		sendHTMLReply(ctx, b, chatID, replyToID, notFoundMsg, log)

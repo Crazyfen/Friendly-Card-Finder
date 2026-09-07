@@ -17,7 +17,16 @@ type Config struct {
 	DeckboxCookiePath       string
 	FreshnessTimeLimitHours int
 	CardListRefreshHours    int
-	CardListBatchSize       int
+}
+
+// envInt reads key as an int, falling back to def when unset or unparsable.
+func envInt(key env.EnvKey, def int) int {
+	if s := key.GetValue(); s != "" {
+		if parsed, err := strconv.Atoi(s); err == nil {
+			return parsed
+		}
+	}
+	return def
 }
 
 func MustLoad() *Config {
@@ -26,26 +35,8 @@ func MustLoad() *Config {
 		log.Fatal(err)
 	}
 
-	freshnessHours := 24
-	if freshnessStr := env.FreshnessTimeLimitHours.GetValue(); freshnessStr != "" {
-		if parsed, err := strconv.Atoi(freshnessStr); err == nil {
-			freshnessHours = parsed
-		}
-	}
-
-	cardListRefreshHours := 3
-	if refreshStr := env.CardListRefreshHours.GetValue(); refreshStr != "" {
-		if parsed, err := strconv.Atoi(refreshStr); err == nil {
-			cardListRefreshHours = parsed
-		}
-	}
-
-	cardListBatchSize := 1000
-	if batchStr := env.CardListBatchSize.GetValue(); batchStr != "" {
-		if parsed, err := strconv.Atoi(batchStr); err == nil && parsed > 0 {
-			cardListBatchSize = parsed
-		}
-	}
+	freshnessHours := envInt(env.FreshnessTimeLimitHours, 24)
+	cardListRefreshHours := envInt(env.CardListRefreshHours, 3)
 
 	storagePath := env.StoragePath.GetValue()
 	deckboxLogin := env.DeckboxLogin.GetValue()
@@ -67,6 +58,5 @@ func MustLoad() *Config {
 		DeckboxCookiePath:       filepath.Join(filepath.Dir(storagePath), "deckbox_session"),
 		FreshnessTimeLimitHours: freshnessHours,
 		CardListRefreshHours:    cardListRefreshHours,
-		CardListBatchSize:       cardListBatchSize,
 	}
 }

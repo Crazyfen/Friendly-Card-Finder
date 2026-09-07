@@ -1,7 +1,6 @@
 package deckbox
 
 import (
-	"FriendlyCardFinder/internal/dto"
 	"context"
 	"errors"
 	"log/slog"
@@ -12,37 +11,41 @@ import (
 
 // fakeStorage is a configurable DeckboxSaver for tests.
 type fakeStorage struct {
-	UpdateTimestampCalled bool
-	saveCardListErr       error
-	saveCardListCalls     int
-	getDeckboxUserFn      func(ctx context.Context, login string) (*DeckboxUser, error)
-	searchCardResults     []dto.CardSearchDTO
-	searchCardFn          func(cardName string) []dto.CardSearchDTO
+	saveCardListErr  error
+	getDeckboxUserFn func(ctx context.Context, login string) (*DeckboxUser, error)
+	searchResults    []CardListWithOwner
+	searchFn         func(cardName string) []CardListWithOwner
 
-	mu              sync.Mutex // guards lastSearch*: SearchCards calls SearchCard concurrently
-	lastSearchName  string
-	lastSearchExact bool
+	// timestampUpdated, when non-nil, is closed the first time the timestamp is
+	// written — so the background refresh Register kicks off can be awaited.
+	timestampUpdated chan struct{}
+
+	mu                    sync.Mutex // Search runs its queries concurrently
+	saveCardListCalls     int
+	UpdateTimestampCalled bool
+	lastSearchName        string
+	lastSearchExact       bool
+	lastSearchScope       string
 }
 
 func (f *fakeStorage) RegisterUser(ctx context.Context, user BotUser) error        { return nil }
 func (f *fakeStorage) SaveDeckboxUser(ctx context.Context, user DeckboxUser) error { return nil }
 func (f *fakeStorage) SaveCardList(ctx context.Context, list CardList) error {
+	f.mu.Lock()
 	f.saveCardListCalls++
+	f.mu.Unlock()
 	return f.saveCardListErr
 }
-func (f *fakeStorage) ClearCardList(ctx context.Context, listId int64) error { return nil }
-func (f *fakeStorage) SearchCard(ctx context.Context, cardName string, scope string, exact bool) ([]dto.CardSearchDTO, error) {
+func (f *fakeStorage) SearchCard(ctx context.Context, q Query) ([]CardListWithOwner, error) {
 	f.mu.Lock()
-	f.lastSearchName = cardName
-	f.lastSearchExact = exact
+	f.lastSearchName = q.Name
+	f.lastSearchExact = q.Exact
+	f.lastSearchScope = q.Scope
 	f.mu.Unlock()
-	if f.searchCardFn != nil {
-		return f.searchCardFn(cardName), nil
+	if f.searchFn != nil {
+		return f.searchFn(q.Name), nil
 	}
-	return f.searchCardResults, nil
-}
-func (f *fakeStorage) GetOwnerByListId(ctx context.Context, listId int64) (*CardListOwnerInfo, error) {
-	return nil, nil
+	return f.searchResults, nil
 }
 func (f *fakeStorage) GetDeckboxUser(ctx context.Context, login string) (*DeckboxUser, error) {
 	if f.getDeckboxUserFn != nil {
@@ -51,14 +54,32 @@ func (f *fakeStorage) GetDeckboxUser(ctx context.Context, login string) (*Deckbo
 	return nil, nil
 }
 func (f *fakeStorage) UpdateDeckboxUserTimestamp(ctx context.Context, login string, updatedAt int64) error {
+	f.mu.Lock()
+	first := !f.UpdateTimestampCalled
 	f.UpdateTimestampCalled = true
+	f.mu.Unlock()
+	if first && f.timestampUpdated != nil {
+		close(f.timestampUpdated)
+	}
 	return nil
 }
 func (f *fakeStorage) GetAllDeckboxUsersWithOldLists(ctx context.Context, thresholdSeconds int64) ([]string, error) {
 	return nil, nil
 }
 
-// fakeScraper is a configurable profileFetcher for tests.
+func (f *fakeStorage) saveCalls() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.saveCardListCalls
+}
+
+func (f *fakeStorage) timestampCalled() bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.UpdateTimestampCalled
+}
+
+// fakeScraper is a configurable Fetcher for tests.
 type fakeScraper struct {
 	fetchErr error
 }
@@ -78,63 +99,116 @@ func (f *fakeScraper) FetchCardList(ctx context.Context, listId int64) (CardList
 	return CardList{ListId: listId, Cards: map[string]int16{"Card_1": 1}}, nil
 }
 
-// --- refreshUserListsWorker ---
+func newTestDeckbox(storage DeckboxSaver, scraper Fetcher) *Deckbox {
+	return New(slog.Default(), storage, scraper, 3, 24)
+}
 
-func TestRefreshWorkerDoesNotUpdateTimestampOnSaveError(t *testing.T) {
+// listMatch builds one grouped storage result.
+func listMatch(listId int64, login string, cards map[string]int16) CardListWithOwner {
+	return CardListWithOwner{
+		CardList:     CardList{ListId: listId, Cards: cards},
+		DeckboxLogin: login,
+	}
+}
+
+// --- Register ---
+
+func TestRegisterRefreshesAndStampsTimestamp(t *testing.T) {
+	// Registration goes through the same refresh as the scheduler, so it must
+	// stamp updated_at — otherwise the new user reads as stale immediately.
+	storage := &fakeStorage{timestampUpdated: make(chan struct{})}
+	d := newTestDeckbox(storage, &fakeScraper{})
+
+	if err := d.Register(context.Background(), Registration{
+		TelegramID:       1,
+		TelegramUsername: "alice",
+		DeckboxLogin:     "alice_db",
+	}); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	select {
+	case <-storage.timestampUpdated:
+	case <-time.After(5 * time.Second):
+		t.Fatal("registration did not refresh the user's lists")
+	}
+}
+
+func TestRegisterReturnsStorageError(t *testing.T) {
+	d := newTestDeckbox(&errorStorage{}, &fakeScraper{})
+	err := d.Register(context.Background(), Registration{DeckboxLogin: "x"})
+	if err == nil {
+		t.Fatal("expected error when RegisterUser fails")
+	}
+}
+
+// errorStorage fails registration and nothing else.
+type errorStorage struct{ fakeStorage }
+
+func (e *errorStorage) RegisterUser(ctx context.Context, user BotUser) error {
+	return errors.New("duplicate user")
+}
+
+// --- refreshUser ---
+
+func TestRefreshUserDoesNotUpdateTimestampOnSaveError(t *testing.T) {
 	storage := &fakeStorage{saveCardListErr: errors.New("save failed")}
-	cards, errStr := refreshUserListsWorker(context.Background(), slog.Default(), storage, &fakeScraper{}, "testuser")
+	d := newTestDeckbox(storage, &fakeScraper{})
+	cards, errStr := d.refreshUser(context.Background(), slog.Default(), "testuser")
 	if cards != 0 {
 		t.Fatalf("expected 0 cards, got %d", cards)
 	}
 	if errStr == "" {
 		t.Fatal("expected non-empty error string when save fails")
 	}
-	if storage.UpdateTimestampCalled {
+	if storage.timestampCalled() {
 		t.Fatal("timestamp must not be updated when save fails")
 	}
 }
 
-func TestRefreshWorkerUpdatesTimestampOnSuccess(t *testing.T) {
+func TestRefreshUserUpdatesTimestampOnSuccess(t *testing.T) {
 	storage := &fakeStorage{}
-	cards, errStr := refreshUserListsWorker(context.Background(), slog.Default(), storage, &fakeScraper{}, "testuser")
+	d := newTestDeckbox(storage, &fakeScraper{})
+	cards, errStr := d.refreshUser(context.Background(), slog.Default(), "testuser")
 	if errStr != "" {
 		t.Fatalf("unexpected error: %s", errStr)
 	}
 	if cards == 0 {
 		t.Fatal("expected non-zero card count on success")
 	}
-	if !storage.UpdateTimestampCalled {
+	if !storage.timestampCalled() {
 		t.Fatal("timestamp must be updated on success")
 	}
 }
 
-func TestRefreshWorkerContextCancelled(t *testing.T) {
+func TestRefreshUserContextCancelled(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	storage := &fakeStorage{}
-	cards, errStr := refreshUserListsWorker(ctx, slog.Default(), storage, &fakeScraper{}, "testuser")
+	d := newTestDeckbox(storage, &fakeScraper{})
+	cards, errStr := d.refreshUser(ctx, slog.Default(), "testuser")
 	if cards != 0 {
 		t.Fatalf("expected 0 cards when context cancelled, got %d", cards)
 	}
 	if errStr == "" {
 		t.Fatal("expected error string when context cancelled")
 	}
-	if storage.UpdateTimestampCalled {
+	if storage.timestampCalled() {
 		t.Fatal("timestamp must not be updated when context is cancelled")
 	}
 }
 
-func TestRefreshWorkerProfileFetchError(t *testing.T) {
+func TestRefreshUserProfileFetchError(t *testing.T) {
 	storage := &fakeStorage{}
-	scraper := &fakeScraper{fetchErr: errors.New("network error")}
-	cards, errStr := refreshUserListsWorker(context.Background(), slog.Default(), storage, scraper, "testuser")
+	d := newTestDeckbox(storage, &fakeScraper{fetchErr: errors.New("network error")})
+	cards, errStr := d.refreshUser(context.Background(), slog.Default(), "testuser")
 	if cards != 0 {
 		t.Fatalf("expected 0 cards on scraper error, got %d", cards)
 	}
 	if errStr == "" {
 		t.Fatal("expected error string when profile fetch fails")
 	}
-	if storage.UpdateTimestampCalled {
+	if storage.timestampCalled() {
 		t.Fatal("timestamp must not be updated when scraper fails")
 	}
 }
@@ -142,135 +216,86 @@ func TestRefreshWorkerProfileFetchError(t *testing.T) {
 // --- saveCardListIfChanged ---
 
 func TestSaveCardListIfChangedSkipsUnchanged(t *testing.T) {
-	// Unique listId per test: the hash cache is package-global.
-	const listId = int64(910001)
 	storage := &fakeStorage{}
+	d := newTestDeckbox(storage, &fakeScraper{})
 	ctx := context.Background()
-	list := CardList{ListId: listId, Cards: map[string]int16{"Bolt": 1}, BodyHash: 42}
+	list := CardList{ListId: 1, Cards: map[string]int16{"Bolt": 1}, BodyHash: 42}
 
-	if !saveCardListIfChanged(ctx, slog.Default(), storage, list) {
+	if !d.saveCardListIfChanged(ctx, slog.Default(), list) {
 		t.Fatal("first save should succeed")
 	}
-	if storage.saveCardListCalls != 1 {
-		t.Fatalf("expected 1 save call, got %d", storage.saveCardListCalls)
+	if storage.saveCalls() != 1 {
+		t.Fatalf("expected 1 save call, got %d", storage.saveCalls())
 	}
 
 	// Same hash again: must skip the save but still report success.
-	if !saveCardListIfChanged(ctx, slog.Default(), storage, list) {
+	if !d.saveCardListIfChanged(ctx, slog.Default(), list) {
 		t.Fatal("unchanged save should report success")
 	}
-	if storage.saveCardListCalls != 1 {
-		t.Fatalf("unchanged list must not be saved again, got %d calls", storage.saveCardListCalls)
+	if storage.saveCalls() != 1 {
+		t.Fatalf("unchanged list must not be saved again, got %d calls", storage.saveCalls())
 	}
 
 	// Changed hash: must save again.
 	list.BodyHash = 43
-	if !saveCardListIfChanged(ctx, slog.Default(), storage, list) {
+	if !d.saveCardListIfChanged(ctx, slog.Default(), list) {
 		t.Fatal("changed save should succeed")
 	}
-	if storage.saveCardListCalls != 2 {
-		t.Fatalf("changed list must be saved, got %d calls", storage.saveCardListCalls)
+	if storage.saveCalls() != 2 {
+		t.Fatalf("changed list must be saved, got %d calls", storage.saveCalls())
+	}
+}
+
+func TestSaveCardListIfChangedIsPerInstance(t *testing.T) {
+	// The hash cache lives on the receiver, so a second Deckbox never inherits
+	// another's skip decisions.
+	list := CardList{ListId: 1, Cards: map[string]int16{"Bolt": 1}, BodyHash: 42}
+
+	storage1 := &fakeStorage{}
+	newTestDeckbox(storage1, &fakeScraper{}).saveCardListIfChanged(context.Background(), slog.Default(), list)
+
+	storage2 := &fakeStorage{}
+	newTestDeckbox(storage2, &fakeScraper{}).saveCardListIfChanged(context.Background(), slog.Default(), list)
+
+	if storage2.saveCalls() != 1 {
+		t.Fatalf("a fresh Deckbox must save the list, got %d calls", storage2.saveCalls())
 	}
 }
 
 func TestSaveCardListIfChangedZeroHashAlwaysSaves(t *testing.T) {
-	const listId = int64(910002)
 	storage := &fakeStorage{}
+	d := newTestDeckbox(storage, &fakeScraper{})
 	ctx := context.Background()
-	list := CardList{ListId: listId, Cards: map[string]int16{"Bolt": 1}} // BodyHash 0
+	list := CardList{ListId: 1, Cards: map[string]int16{"Bolt": 1}} // BodyHash 0
 
-	saveCardListIfChanged(ctx, slog.Default(), storage, list)
-	saveCardListIfChanged(ctx, slog.Default(), storage, list)
-	if storage.saveCardListCalls != 2 {
-		t.Fatalf("zero hash must never be skipped, got %d calls", storage.saveCardListCalls)
+	d.saveCardListIfChanged(ctx, slog.Default(), list)
+	d.saveCardListIfChanged(ctx, slog.Default(), list)
+	if storage.saveCalls() != 2 {
+		t.Fatalf("zero hash must never be skipped, got %d calls", storage.saveCalls())
 	}
 }
 
 func TestSaveCardListIfChangedFailedSaveNotCached(t *testing.T) {
-	const listId = int64(910003)
 	storage := &fakeStorage{saveCardListErr: errors.New("disk full")}
+	d := newTestDeckbox(storage, &fakeScraper{})
 	ctx := context.Background()
-	list := CardList{ListId: listId, Cards: map[string]int16{"Bolt": 1}, BodyHash: 42}
+	list := CardList{ListId: 1, Cards: map[string]int16{"Bolt": 1}, BodyHash: 42}
 
-	if saveCardListIfChanged(ctx, slog.Default(), storage, list) {
+	if d.saveCardListIfChanged(ctx, slog.Default(), list) {
 		t.Fatal("failed save must report failure")
 	}
 
 	// After the failure the hash must not be cached: the retry must save again.
 	storage.saveCardListErr = nil
-	if !saveCardListIfChanged(ctx, slog.Default(), storage, list) {
+	if !d.saveCardListIfChanged(ctx, slog.Default(), list) {
 		t.Fatal("retry save should succeed")
 	}
-	if storage.saveCardListCalls != 2 {
-		t.Fatalf("expected retry to hit storage, got %d calls", storage.saveCardListCalls)
+	if storage.saveCalls() != 2 {
+		t.Fatalf("expected retry to hit storage, got %d calls", storage.saveCalls())
 	}
 }
 
-// --- SearchCard ---
-
-func TestSearchCardGroupsByListId(t *testing.T) {
-	// Two cards from list 10, one card from list 20 — results arrive pre-sorted by listId.
-	searchResults := []dto.CardSearchDTO{
-		{ListId: 10, CardName: "Bolt", Quantity: 2},
-		{ListId: 10, CardName: "Shock", Quantity: 1},
-		{ListId: 20, CardName: "Bolt", Quantity: 4},
-	}
-	storage := &fakeStorage{searchCardResults: searchResults}
-	result, err := SearchCard(context.Background(), slog.Default(), storage, "Bolt", ScopeTradelist)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if len(result.SearchResults) != 2 {
-		t.Fatalf("expected 2 groups (one per list), got %d", len(result.SearchResults))
-	}
-	if result.SearchQuery != "Bolt" {
-		t.Fatalf("expected query 'Bolt', got %q", result.SearchQuery)
-	}
-	if result.SearchResults[0].ListId != 10 || len(result.SearchResults[0].Cards) != 2 {
-		t.Errorf("first group: want listId=10 with 2 cards, got %+v", result.SearchResults[0])
-	}
-	if result.SearchResults[1].ListId != 20 || len(result.SearchResults[1].Cards) != 1 {
-		t.Errorf("second group: want listId=20 with 1 card, got %+v", result.SearchResults[1])
-	}
-}
-
-func TestSearchCardSameCardAcrossLists(t *testing.T) {
-	// Same card name in two different lists should produce two separate groups.
-	searchResults := []dto.CardSearchDTO{
-		{ListId: 1, CardName: "Lightning Bolt", Quantity: 4},
-		{ListId: 2, CardName: "Lightning Bolt", Quantity: 2},
-	}
-	storage := &fakeStorage{searchCardResults: searchResults}
-	result, err := SearchCard(context.Background(), slog.Default(), storage, "Lightning Bolt", ScopeTradelist)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if len(result.SearchResults) != 2 {
-		t.Fatalf("expected 2 groups, got %d", len(result.SearchResults))
-	}
-	qty, _ := result.SearchResults[0].GetCardQuantity("Lightning Bolt")
-	if qty != 4 {
-		t.Errorf("list 1: expected qty=4, got %d", qty)
-	}
-	qty, _ = result.SearchResults[1].GetCardQuantity("Lightning Bolt")
-	if qty != 2 {
-		t.Errorf("list 2: expected qty=2, got %d", qty)
-	}
-}
-
-func TestSearchCardEmpty(t *testing.T) {
-	storage := &fakeStorage{}
-	result, err := SearchCard(context.Background(), slog.Default(), storage, "Nonexistent", ScopeTradelist)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if len(result.SearchResults) != 0 {
-		t.Fatalf("expected empty results, got %d", len(result.SearchResults))
-	}
-	if result.SearchQuery != "Nonexistent" {
-		t.Errorf("expected query preserved, got %q", result.SearchQuery)
-	}
-}
+// --- ParseExactQuery ---
 
 func TestParseExactQuery(t *testing.T) {
 	tests := []struct {
@@ -303,9 +328,55 @@ func TestParseExactQuery(t *testing.T) {
 	}
 }
 
-func TestSearchCardQuotedQueryIsExact(t *testing.T) {
+// --- Search: single card (the n=1 case) ---
+
+func TestSearchSingleCardKeepsOneAggregatePerList(t *testing.T) {
+	storage := &fakeStorage{searchResults: []CardListWithOwner{
+		listMatch(10, "alice", map[string]int16{"Bolt": 2, "Shock": 1}),
+		listMatch(20, "bob", map[string]int16{"Bolt": 4}),
+	}}
+	d := newTestDeckbox(storage, &fakeScraper{})
+
+	result, err := d.Search(context.Background(), []string{"Bolt"}, ScopeTradelist)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(result.SearchQueries) != 1 || result.SearchQueries[0] != "Bolt" {
+		t.Fatalf("expected query 'Bolt', got %v", result.SearchQueries)
+	}
+	if len(result.Aggregates) != 2 {
+		t.Fatalf("expected 2 aggregates (one per list), got %d", len(result.Aggregates))
+	}
+	// alice holds 2 distinct matching names, so she ranks first.
+	if result.Aggregates[0].DeckboxLogin != "alice" || result.Aggregates[0].UniqueCount != 2 {
+		t.Errorf("first aggregate: want alice with 2 cards, got %+v", result.Aggregates[0])
+	}
+	if result.Aggregates[1].ListId != 20 || result.Aggregates[1].FoundCards["Bolt"] != 4 {
+		t.Errorf("second aggregate: want list 20 with Bolt=4, got %+v", result.Aggregates[1])
+	}
+}
+
+func TestSearchSingleCardEmpty(t *testing.T) {
+	d := newTestDeckbox(&fakeStorage{}, &fakeScraper{})
+	result, err := d.Search(context.Background(), []string{"Nonexistent"}, ScopeTradelist)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(result.Aggregates) != 0 {
+		t.Fatalf("expected empty results, got %d", len(result.Aggregates))
+	}
+	if result.SearchQueries[0] != "Nonexistent" {
+		t.Errorf("expected query preserved, got %q", result.SearchQueries[0])
+	}
+	if len(result.NotFound) != 1 || result.NotFound[0] != "Nonexistent" {
+		t.Errorf("expected the query in NotFound, got %v", result.NotFound)
+	}
+}
+
+func TestSearchQuotedQueryIsExact(t *testing.T) {
 	storage := &fakeStorage{}
-	result, err := SearchCard(context.Background(), slog.Default(), storage, `"Lightning Bolt"`, ScopeTradelist)
+	d := newTestDeckbox(storage, &fakeScraper{})
+	result, err := d.Search(context.Background(), []string{`"Lightning Bolt"`}, ScopeTradelist)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -315,14 +386,15 @@ func TestSearchCardQuotedQueryIsExact(t *testing.T) {
 	if storage.lastSearchName != "Lightning Bolt" {
 		t.Errorf("expected quotes stripped from storage query, got %q", storage.lastSearchName)
 	}
-	if result.SearchQuery != "Lightning Bolt" {
-		t.Errorf("expected quotes stripped from SearchQuery, got %q", result.SearchQuery)
+	if result.SearchQueries[0] != "Lightning Bolt" {
+		t.Errorf("expected quotes stripped from SearchQueries, got %q", result.SearchQueries[0])
 	}
 }
 
-func TestSearchCardUnquotedQueryIsNotExact(t *testing.T) {
+func TestSearchUnquotedQueryIsNotExact(t *testing.T) {
 	storage := &fakeStorage{}
-	_, err := SearchCard(context.Background(), slog.Default(), storage, "Lightning Bolt", ScopeTradelist)
+	d := newTestDeckbox(storage, &fakeScraper{})
+	_, err := d.Search(context.Background(), []string{"Lightning Bolt"}, ScopeTradelist)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -334,28 +406,41 @@ func TestSearchCardUnquotedQueryIsNotExact(t *testing.T) {
 	}
 }
 
-// --- SearchCards (multi-card aggregation) ---
+func TestSearchPassesScopeThrough(t *testing.T) {
+	storage := &fakeStorage{}
+	d := newTestDeckbox(storage, &fakeScraper{})
 
-func TestSearchCardsAggregatesByListId(t *testing.T) {
+	if _, err := d.Search(context.Background(), []string{"Bolt"}, ScopeWishlist); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if storage.lastSearchScope != ScopeWishlist {
+		t.Errorf("expected scope %q to reach storage, got %q", ScopeWishlist, storage.lastSearchScope)
+	}
+}
+
+// --- Search: multiple cards ---
+
+func TestSearchAggregatesByListId(t *testing.T) {
 	// list 1 has both cards; list 2 has only Bolt.
 	storage := &fakeStorage{
-		searchCardFn: func(cardName string) []dto.CardSearchDTO {
+		searchFn: func(cardName string) []CardListWithOwner {
 			switch cardName {
 			case "Bolt":
-				return []dto.CardSearchDTO{
-					{ListId: 1, DeckboxLogin: "alice", CardName: "Bolt", Quantity: 4},
-					{ListId: 2, DeckboxLogin: "bob", CardName: "Bolt", Quantity: 2},
+				return []CardListWithOwner{
+					listMatch(1, "alice", map[string]int16{"Bolt": 4}),
+					listMatch(2, "bob", map[string]int16{"Bolt": 2}),
 				}
 			case "Shock":
-				return []dto.CardSearchDTO{
-					{ListId: 1, DeckboxLogin: "alice", CardName: "Shock", Quantity: 3},
+				return []CardListWithOwner{
+					listMatch(1, "alice", map[string]int16{"Shock": 3}),
 				}
 			}
 			return nil
 		},
 	}
+	d := newTestDeckbox(storage, &fakeScraper{})
 
-	result, err := SearchCards(context.Background(), slog.Default(), storage, []string{"Bolt", "Shock"}, ScopeTradelist)
+	result, err := d.Search(context.Background(), []string{"Bolt", "Shock"}, ScopeTradelist)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -379,16 +464,17 @@ func TestSearchCardsAggregatesByListId(t *testing.T) {
 	}
 }
 
-func TestSearchCardsTracksNotFound(t *testing.T) {
+func TestSearchTracksNotFound(t *testing.T) {
 	storage := &fakeStorage{
-		searchCardFn: func(cardName string) []dto.CardSearchDTO {
+		searchFn: func(cardName string) []CardListWithOwner {
 			if cardName == "Bolt" {
-				return []dto.CardSearchDTO{{ListId: 1, DeckboxLogin: "alice", CardName: "Bolt", Quantity: 1}}
+				return []CardListWithOwner{listMatch(1, "alice", map[string]int16{"Bolt": 1})}
 			}
 			return nil
 		},
 	}
-	result, err := SearchCards(context.Background(), slog.Default(), storage, []string{"Bolt", "Force of Will", "Black Lotus"}, ScopeTradelist)
+	d := newTestDeckbox(storage, &fakeScraper{})
+	result, err := d.Search(context.Background(), []string{"Bolt", "Force of Will", "Black Lotus"}, ScopeTradelist)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -400,28 +486,29 @@ func TestSearchCardsTracksNotFound(t *testing.T) {
 	}
 }
 
-func TestSearchCardsSortOrder(t *testing.T) {
+func TestSearchSortOrder(t *testing.T) {
 	// Three lists: A (unique=1, total=10), B (unique=2, total=3), C (unique=2, total=5).
 	// Expected: C, B, A — unique DESC then total DESC.
 	storage := &fakeStorage{
-		searchCardFn: func(cardName string) []dto.CardSearchDTO {
+		searchFn: func(cardName string) []CardListWithOwner {
 			switch cardName {
 			case "X":
-				return []dto.CardSearchDTO{
-					{ListId: 1, DeckboxLogin: "a", CardName: "X", Quantity: 10},
-					{ListId: 2, DeckboxLogin: "b", CardName: "X", Quantity: 1},
-					{ListId: 3, DeckboxLogin: "c", CardName: "X", Quantity: 1},
+				return []CardListWithOwner{
+					listMatch(1, "a", map[string]int16{"X": 10}),
+					listMatch(2, "b", map[string]int16{"X": 1}),
+					listMatch(3, "c", map[string]int16{"X": 1}),
 				}
 			case "Y":
-				return []dto.CardSearchDTO{
-					{ListId: 2, DeckboxLogin: "b", CardName: "Y", Quantity: 2},
-					{ListId: 3, DeckboxLogin: "c", CardName: "Y", Quantity: 4},
+				return []CardListWithOwner{
+					listMatch(2, "b", map[string]int16{"Y": 2}),
+					listMatch(3, "c", map[string]int16{"Y": 4}),
 				}
 			}
 			return nil
 		},
 	}
-	result, err := SearchCards(context.Background(), slog.Default(), storage, []string{"X", "Y"}, ScopeTradelist)
+	d := newTestDeckbox(storage, &fakeScraper{})
+	result, err := d.Search(context.Background(), []string{"X", "Y"}, ScopeTradelist)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -434,21 +521,22 @@ func TestSearchCardsSortOrder(t *testing.T) {
 	}
 }
 
-func TestSearchCardsStripsQuotes(t *testing.T) {
+func TestSearchStripsQuotes(t *testing.T) {
 	storage := &fakeStorage{
-		searchCardFn: func(cardName string) []dto.CardSearchDTO {
+		searchFn: func(cardName string) []CardListWithOwner {
 			if cardName == "Bolt" {
-				return []dto.CardSearchDTO{{ListId: 1, DeckboxLogin: "alice", CardName: "Bolt", Quantity: 1}}
+				return []CardListWithOwner{listMatch(1, "alice", map[string]int16{"Bolt": 1})}
 			}
 			return nil
 		},
 	}
-	result, err := SearchCards(context.Background(), slog.Default(), storage, []string{`"Bolt"`, `"Shock"`}, ScopeTradelist)
+	d := newTestDeckbox(storage, &fakeScraper{})
+	result, err := d.Search(context.Background(), []string{`"Bolt"`, `"Shock"`}, ScopeTradelist)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	// Quoted lines are searched exactly, and both SearchQueries and NotFound
-	// echo the stripped names, matching the single-card path's SearchQuery.
+	// echo the stripped names.
 	if !storage.lastSearchExact {
 		t.Error("expected quoted lines to run as exact searches")
 	}
@@ -460,9 +548,9 @@ func TestSearchCardsStripsQuotes(t *testing.T) {
 	}
 }
 
-func TestSearchCardsAllNotFound(t *testing.T) {
-	storage := &fakeStorage{} // returns nil for any card
-	result, err := SearchCards(context.Background(), slog.Default(), storage, []string{"A", "B"}, ScopeTradelist)
+func TestSearchAllNotFound(t *testing.T) {
+	d := newTestDeckbox(&fakeStorage{}, &fakeScraper{}) // returns nil for any card
+	result, err := d.Search(context.Background(), []string{"A", "B"}, ScopeTradelist)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -474,16 +562,17 @@ func TestSearchCardsAllNotFound(t *testing.T) {
 	}
 }
 
-// --- SuggestDeckbox freshness filter ---
+// --- Suggest freshness filter ---
 
-func TestSuggestDeckboxSkipsFreshUsers(t *testing.T) {
+func TestSuggestSkipsFreshUsers(t *testing.T) {
 	recentTS := time.Now().Add(-1 * time.Hour).Unix() // 1 h ago — fresh within 24 h limit
 	storage := &fakeStorage{
 		getDeckboxUserFn: func(_ context.Context, login string) (*DeckboxUser, error) {
 			return &DeckboxUser{DeckboxLogin: login, UpdatedAt: &recentTS}, nil
 		},
 	}
-	result := SuggestDeckbox(context.Background(), slog.Default(), storage, &fakeScraper{}, []string{"user1", "user2"}, 24)
+	d := newTestDeckbox(storage, &fakeScraper{})
+	result := d.Suggest(context.Background(), []string{"user1", "user2"})
 	if result.SkippedCount != 2 {
 		t.Errorf("expected 2 skipped (fresh), got %d", result.SkippedCount)
 	}
@@ -492,14 +581,15 @@ func TestSuggestDeckboxSkipsFreshUsers(t *testing.T) {
 	}
 }
 
-func TestSuggestDeckboxNilTimestampNotSkipped(t *testing.T) {
+func TestSuggestNilTimestampNotSkipped(t *testing.T) {
 	// A user with no prior timestamp must always be processed.
 	storage := &fakeStorage{
 		getDeckboxUserFn: func(_ context.Context, login string) (*DeckboxUser, error) {
 			return &DeckboxUser{DeckboxLogin: login, UpdatedAt: nil}, nil
 		},
 	}
-	result := SuggestDeckbox(context.Background(), slog.Default(), storage, &fakeScraper{}, []string{"user1"}, 24)
+	d := newTestDeckbox(storage, &fakeScraper{})
+	result := d.Suggest(context.Background(), []string{"user1"})
 	if result.SkippedCount != 0 {
 		t.Errorf("nil timestamp should not be skipped, got SkippedCount=%d", result.SkippedCount)
 	}
@@ -508,7 +598,7 @@ func TestSuggestDeckboxNilTimestampNotSkipped(t *testing.T) {
 	}
 }
 
-func TestSuggestDeckboxStaleUserIsProcessed(t *testing.T) {
+func TestSuggestStaleUserIsProcessed(t *testing.T) {
 	// A user whose last update is older than the freshness limit must be processed.
 	oldTS := time.Now().Add(-48 * time.Hour).Unix() // 48 h ago — stale against 24 h limit
 	storage := &fakeStorage{
@@ -516,7 +606,8 @@ func TestSuggestDeckboxStaleUserIsProcessed(t *testing.T) {
 			return &DeckboxUser{DeckboxLogin: login, UpdatedAt: &oldTS}, nil
 		},
 	}
-	result := SuggestDeckbox(context.Background(), slog.Default(), storage, &fakeScraper{}, []string{"user1"}, 24)
+	d := newTestDeckbox(storage, &fakeScraper{})
+	result := d.Suggest(context.Background(), []string{"user1"})
 	if result.SkippedCount != 0 {
 		t.Errorf("stale user must not be skipped, got SkippedCount=%d", result.SkippedCount)
 	}
@@ -525,9 +616,9 @@ func TestSuggestDeckboxStaleUserIsProcessed(t *testing.T) {
 	}
 }
 
-func TestSuggestDeckboxEmptyLogins(t *testing.T) {
-	storage := &fakeStorage{}
-	result := SuggestDeckbox(context.Background(), slog.Default(), storage, &fakeScraper{}, []string{}, 24)
+func TestSuggestEmptyLogins(t *testing.T) {
+	d := newTestDeckbox(&fakeStorage{}, &fakeScraper{})
+	result := d.Suggest(context.Background(), []string{})
 	if result.ProcessedCount != 0 || result.SkippedCount != 0 || len(result.Errors) != 0 {
 		t.Errorf("expected zero result for empty login list, got %+v", result)
 	}
