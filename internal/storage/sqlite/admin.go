@@ -310,16 +310,21 @@ const (
 
 // tradeMatchFrom selects a Trade Match: a wishlist Card held in a different
 // owner's tradelist. Shared by the count and the listing so they cannot disagree.
+//
+// CROSS JOIN pins SQLite's join order: led by the few deckbox_users rows, only
+// their lists are read via (listId, cardName). A plain JOIN walks all of
+// card_lists by cardName (~7x slower, BenchmarkAdminInsights).
 const tradeMatchFrom = `
-	FROM card_lists AS w
-	JOIN deckbox_users AS dw ON w.listId = dw.wishlistId
+	FROM deckbox_users AS dw
+	CROSS JOIN card_lists AS w ON w.listId = dw.wishlistId
 	JOIN card_lists AS t ON t.cardName = w.cardName
 	JOIN deckbox_users AS dt ON t.listId = dt.tradelistId
 	WHERE dt.deckboxLogin <> dw.deckboxLogin`
 
-// AdminInsights builds the analytics page. Three of its queries scan card_lists
-// (~0.5s each on a 200k-row database), so callers cache the result rather than
-// recomputing it per request.
+// AdminInsights builds the analytics page. Its card queries aggregate every
+// wishlist and tradelist (~100ms together on a 200k-row database, see
+// BenchmarkAdminInsights), so callers cache the result rather than recomputing
+// it per request.
 func (s *SQLiteStorage) AdminInsights(ctx context.Context) (deckbox.Insights, error) {
 	const op = "storage.sqlite.AdminInsights"
 
@@ -346,8 +351,8 @@ func (s *SQLiteStorage) AdminInsights(ctx context.Context) (deckbox.Insights, er
 	// Wishlist demand, which exists independently of anyone searching.
 	in.MostWanted, err = collect(ctx, s.db.readDB, `
 	SELECT w.cardName, COUNT(DISTINCT d.deckboxLogin) AS wishers
-	FROM card_lists AS w
-	JOIN deckbox_users AS d ON w.listId = d.wishlistId
+	FROM deckbox_users AS d
+	CROSS JOIN card_lists AS w ON w.listId = d.wishlistId
 	GROUP BY w.cardName
 	ORDER BY wishers DESC, w.cardName
 	LIMIT ?`, []any{insightsLimit},
@@ -381,8 +386,8 @@ func (s *SQLiteStorage) AdminInsights(ctx context.Context) (deckbox.Insights, er
 	in.Supply, err = collect(ctx, s.db.readDB, `
 	SELECT owners, COUNT(*) AS cards FROM (
 		SELECT c.cardName, COUNT(DISTINCT d.deckboxLogin) AS owners
-		FROM card_lists AS c
-		JOIN deckbox_users AS d ON c.listId = d.tradelistId
+		FROM deckbox_users AS d
+		CROSS JOIN card_lists AS c ON c.listId = d.tradelistId
 		GROUP BY c.cardName
 	)
 	GROUP BY owners

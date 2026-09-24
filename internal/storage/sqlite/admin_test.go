@@ -4,6 +4,9 @@ import (
 	"FriendlyCardFinder/internal/deckbox"
 	"context"
 	"errors"
+	"fmt"
+	"math/rand/v2"
+	"slices"
 	"testing"
 	"time"
 )
@@ -339,5 +342,74 @@ func TestAdminOverviewCountsOrphansAndMissingLists(t *testing.T) {
 	// masha: an empty tradelist and no wishlist id at all.
 	if missing != 2 {
 		t.Errorf("expected 2 missing lists, got %d", missing)
+	}
+}
+
+func TestAdminInsightsCardAnalytics(t *testing.T) {
+	// Both users hold Lightning Bolt in every list plus one signature card, so
+	// Bolt is wished by two, traded both ways, and the only card with two owners.
+	ctx := context.Background()
+	s := newTestDB(t)
+	seedUser(t, s, "anna", 100, true)
+	seedUser(t, s, "bob", 200, false)
+
+	in, err := s.AdminInsights(ctx)
+	if err != nil {
+		t.Fatalf("admin insights failed: %v", err)
+	}
+
+	if len(in.MostWanted) == 0 || in.MostWanted[0] != (deckbox.CardDemand{CardName: "Lightning Bolt", Wishers: 2}) {
+		t.Errorf("most wanted: got %+v", in.MostWanted)
+	}
+	want := []deckbox.TradeMatch{
+		{Wisher: "anna", CardName: "Lightning Bolt", Holder: "bob", Quantity: 2},
+		{Wisher: "bob", CardName: "Lightning Bolt", Holder: "anna", Quantity: 2},
+	}
+	if in.TradeMatchTotal != 2 || !slices.Equal(in.TradeMatches, want) {
+		t.Errorf("trade matches: total %d, got %+v", in.TradeMatchTotal, in.TradeMatches)
+	}
+	wantSupply := []deckbox.SupplyBucket{{Owners: 1, Cards: 2}, {Owners: 2, Cards: 1}}
+	if !slices.Equal(in.Supply, wantSupply) {
+		t.Errorf("supply: got %+v", in.Supply)
+	}
+}
+
+// BenchmarkAdminInsights runs the analytics page over a collection shaped like
+// production (56 Deckbox Users, ~240k card rows drawn from a shared pool of
+// names, so wishlists and tradelists overlap the way real ones do).
+func BenchmarkAdminInsights(b *testing.B) {
+	ctx := context.Background()
+	s := newTestDB(b)
+	rng := rand.New(rand.NewPCG(1, 2))
+
+	const users, pool = 56, 27000
+	pick := func(n int) map[string]int16 {
+		cards := make(map[string]int16, n)
+		for len(cards) < n {
+			cards[fmt.Sprintf("Card %05d", rng.IntN(pool))] = int16(1 + rng.IntN(4))
+		}
+		return cards
+	}
+	for u := range int64(users) {
+		inv, trade, wish := u*10+1, u*10+2, u*10+3
+		if err := s.SaveDeckboxUser(ctx, deckbox.DeckboxUser{
+			DeckboxLogin: fmt.Sprintf("user%02d", u),
+			InventoryID:  &inv,
+			TradelistID:  &trade,
+			WishlistID:   &wish,
+		}); err != nil {
+			b.Fatalf("save deckbox user: %v", err)
+		}
+		for id, n := range map[int64]int{inv: 2500, trade: 1300, wish: 40} {
+			if err := s.SaveCardList(ctx, deckbox.CardList{ListId: id, Cards: pick(n)}); err != nil {
+				b.Fatalf("save card list %d: %v", id, err)
+			}
+		}
+	}
+
+	for b.Loop() {
+		if _, err := s.AdminInsights(ctx); err != nil {
+			b.Fatalf("admin insights: %v", err)
+		}
 	}
 }

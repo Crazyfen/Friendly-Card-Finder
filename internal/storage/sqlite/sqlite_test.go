@@ -14,7 +14,7 @@ import (
 )
 
 // newTestDB creates a SQLiteStorage backed by a temp file and registers cleanup.
-func newTestDB(t *testing.T) *SQLiteStorage {
+func newTestDB(t testing.TB) *SQLiteStorage {
 	t.Helper()
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 	s, err := New(t.TempDir()+"/test.db", log, defaultCardBatchSize)
