@@ -7,6 +7,9 @@ WORKDIR /app
 
 COPY go.mod go.sum ./
 RUN go mod download
+# Compile the cgo SQLite driver (~2 min) in a layer keyed only on go.mod/go.sum,
+# so code-only pushes reuse it. Tags and env must match the final build below.
+RUN CGO_ENABLED=1 GOAMD64=v2 go build -tags "fts5" github.com/mattn/go-sqlite3
 
 COPY . .
 
