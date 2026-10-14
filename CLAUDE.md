@@ -94,7 +94,7 @@ All profile/export fetches go through one shared `http.Transport` (keep-alive, 1
 
 ### Worker pool
 
-`Deckbox.refreshUsers` is the reusable coordinator; `Deckbox.refreshUser` fetches profile + 3 lists for one user and **returns** a `RefreshOutcome` without writing anything. `refreshUsers` is the only place an outcome is judged and stored: reaching and saving the profile (`ProfileSaved`) is what stamps `updated_at`, so an empty collection or a Card List that failed to fetch is recorded in `Err` but still counts as read — see `docs/adr/0006`. Every caller goes through this pool — there is no second refresh path:
+`Deckbox.refreshUsers` is the reusable coordinator; `Deckbox.refreshUser` fetches profile + 3 lists for one user and **returns** a `RefreshOutcome` without writing anything. `refreshUsers` is the only place an outcome is judged and stored: reaching and saving the profile (`ProfileSaved`) is what stamps `updated_at`, so an empty collection or a Card List that failed to fetch is recorded in `Err` but still counts as read — see `docs/adr/0006`. A Private Card List is deleted, not failed: an id the profile stops showing is deleted inside `SaveDeckboxUser`, and an export answering 404 (`ErrNotFound`, never retried) is saved empty with hash 0. `sqlite.New` sweeps any list no Deckbox User references — see `docs/adr/0009`. Every caller goes through this pool — there is no second refresh path:
 
 - `RefreshStale` — 10 workers, no filter
 - `Suggest` — 5 workers + freshness pre-filter

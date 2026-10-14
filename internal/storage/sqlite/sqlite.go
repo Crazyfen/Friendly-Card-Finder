@@ -127,13 +127,17 @@ func New(dataSourceName string, log *slog.Logger, batchSize int) (*SQLiteStorage
 		batchSize = defaultCardBatchSize
 	}
 
-	return &SQLiteStorage{
+	s := &SQLiteStorage{
 		db:         db,
 		log:        log,
 		ftsEnabled: ftsEnabled,
 		batchSize:  batchSize,
 		stmtCache:  make(map[string]*sql.Stmt),
-	}, nil
+	}
+	if err := s.deleteUnreferencedLists(context.Background()); err != nil {
+		return nil, fmt.Errorf("%s: delete unreferenced lists: %w", op, err)
+	}
+	return s, nil
 }
 
 // cachedStmt returns a cached prepared statement for query on the given pool,
@@ -213,25 +217,128 @@ func (s *SQLiteStorage) RegisterUser(ctx context.Context, user deckbox.BotUser) 
 	return nil
 }
 
+// SaveDeckboxUser stores the profile's Card List ids. A list the profile no
+// longer shows has gone private, so its cards are deleted in the same
+// transaction — the bot keeps no copy of a Private Card List (docs/adr/0009).
 func (s *SQLiteStorage) SaveDeckboxUser(ctx context.Context, user deckbox.DeckboxUser) error {
 	const op = "storage.sqlite.SaveDeckboxUser"
 
-	stmt, err := s.writeStmt(ctx, `
+	tx, err := s.db.writeDB.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("%s: %w", op, err)
+	}
+	defer tx.Rollback()
+
+	var old [3]*int64
+	err = tx.QueryRowContext(ctx, `SELECT inventoryId, tradelistId, wishlistId FROM deckbox_users WHERE deckboxLogin = ?`,
+		user.DeckboxLogin).Scan(&old[0], &old[1], &old[2])
+	if err != nil && err != sql.ErrNoRows {
+		return fmt.Errorf("%s: %w", op, err)
+	}
+
+	_, err = tx.ExecContext(ctx, `
 	INSERT INTO deckbox_users(deckboxLogin, inventoryId, tradelistId, wishlistId)
 	VALUES (?, ?, ?, ?)
 	ON CONFLICT(deckboxLogin) DO UPDATE SET
 		inventoryId = excluded.inventoryId,
 		tradelistId = excluded.tradelistId,
-		wishlistId  = excluded.wishlistId;`)
+		wishlistId  = excluded.wishlistId;`,
+		user.DeckboxLogin, user.InventoryID, user.TradelistID, user.WishlistID)
 	if err != nil {
 		return fmt.Errorf("%s: %w", op, err)
 	}
 
-	_, err = stmt.Exec(user.DeckboxLogin, user.InventoryID, user.TradelistID, user.WishlistID)
-	if err != nil {
-		return fmt.Errorf("%s: %w", op, err)
+	kept := map[int64]bool{}
+	for _, id := range []*int64{user.InventoryID, user.TradelistID, user.WishlistID} {
+		if id != nil {
+			kept[*id] = true
+		}
+	}
+	for _, id := range old {
+		if id != nil && !kept[*id] {
+			if _, err := s.deleteList(ctx, tx, *id); err != nil {
+				return fmt.Errorf("%s: %w", op, err)
+			}
+		}
 	}
 
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("%s: %w", op, err)
+	}
+	return nil
+}
+
+// deleteList removes every trace of one Card List — rows, FTS rows, stored
+// hash and size history — and reports how many card rows went.
+func (s *SQLiteStorage) deleteList(ctx context.Context, tx *sql.Tx, id int64) (int64, error) {
+	res, err := tx.ExecContext(ctx, `DELETE FROM card_lists WHERE listId = ?`, id)
+	if err != nil {
+		return 0, fmt.Errorf("card_lists: %w", err)
+	}
+	n, _ := res.RowsAffected()
+
+	if s.ftsEnabled {
+		// MATCH on the indexed listId column, as in SaveCardList: a plain
+		// WHERE listId = ? would scan the whole FTS table.
+		if _, err := tx.ExecContext(ctx, `DELETE FROM card_lists_fts WHERE card_lists_fts MATCH ?`, ftsListIdQuery(id)); err != nil {
+			return n, fmt.Errorf("card_lists_fts: %w", err)
+		}
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM card_list_hashes WHERE listId = ?`, id); err != nil {
+		return n, fmt.Errorf("card_list_hashes: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM list_snapshots WHERE listId = ?`, id); err != nil {
+		return n, fmt.Errorf("list_snapshots: %w", err)
+	}
+	return n, nil
+}
+
+// deleteUnreferencedLists removes Card Lists no Deckbox User points at. Before
+// SaveDeckboxUser deleted Private Card Lists, a list that went private kept its
+// rows forever; this clears those at startup and catches any future path that
+// strands a list the same way.
+func (s *SQLiteStorage) deleteUnreferencedLists(ctx context.Context) error {
+	const unreferenced = `
+	SELECT listId FROM card_lists EXCEPT SELECT listId FROM (
+		SELECT inventoryId AS listId FROM deckbox_users
+		UNION SELECT tradelistId FROM deckbox_users
+		UNION SELECT wishlistId FROM deckbox_users)`
+
+	rows, err := s.db.writeDB.QueryContext(ctx, unreferenced)
+	if err != nil {
+		return err
+	}
+	var ids []int64
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			rows.Close()
+			return err
+		}
+		ids = append(ids, id)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil || len(ids) == 0 {
+		return err
+	}
+
+	tx, err := s.db.writeDB.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	var total int64
+	for _, id := range ids {
+		n, err := s.deleteList(ctx, tx, id)
+		if err != nil {
+			return err
+		}
+		total += n
+	}
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	s.log.Info("deleted unreferenced card lists", slog.Int("lists", len(ids)), slog.Int64("card_rows", total))
 	return nil
 }
 

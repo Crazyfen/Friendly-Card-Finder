@@ -3,6 +3,7 @@ package deckbox
 import (
 	"FriendlyCardFinder/internal/lib/logger/sl"
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"sort"
@@ -120,6 +121,16 @@ func (d *Deckbox) refreshUser(ctx context.Context, log *slog.Logger, login strin
 			continue
 		}
 		cardList, err := d.scraper.FetchCardList(ctx, *l.id)
+		if errors.Is(err, ErrNotFound) {
+			// A Private Card List: keep no copy of it. Saving it empty with an
+			// unknown hash clears its rows, FTS rows and stored hash, and it is
+			// not a failure — the owner chose this (docs/adr/0009).
+			if err := d.storage.SaveCardList(ctx, CardList{ListId: *l.id}); err != nil {
+				log.Error("failed to delete private "+l.name, sl.Err(err))
+				failures = append(failures, fmt.Sprintf("%s: %v", l.name, err))
+			}
+			continue
+		}
 		if err != nil {
 			log.Error("failed to fetch "+l.name, sl.Err(err))
 			failures = append(failures, fmt.Sprintf("%s: %v", l.name, err))

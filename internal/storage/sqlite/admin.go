@@ -158,29 +158,11 @@ func (s *SQLiteStorage) PurgeDeckboxUser(ctx context.Context, login string) (dec
 		}
 		result.ListIDs = append(result.ListIDs, *id)
 
-		res, err := tx.ExecContext(ctx, `DELETE FROM card_lists WHERE listId = ?`, *id)
+		n, err := s.deleteList(ctx, tx, *id)
 		if err != nil {
-			return result, fmt.Errorf("%s: card_lists: %w", op, err)
+			return result, fmt.Errorf("%s: %w", op, err)
 		}
-		if n, err := res.RowsAffected(); err == nil {
-			result.CardRows += n
-		}
-
-		if s.ftsEnabled {
-			// MATCH on the indexed listId column, as in SaveCardList: a plain
-			// WHERE listId = ? would scan the whole FTS table.
-			if _, err := tx.ExecContext(ctx, `DELETE FROM card_lists_fts WHERE card_lists_fts MATCH ?`, ftsListIdQuery(*id)); err != nil {
-				return result, fmt.Errorf("%s: card_lists_fts: %w", op, err)
-			}
-		}
-
-		if _, err := tx.ExecContext(ctx, `DELETE FROM card_list_hashes WHERE listId = ?`, *id); err != nil {
-			return result, fmt.Errorf("%s: card_list_hashes: %w", op, err)
-		}
-
-		if _, err := tx.ExecContext(ctx, `DELETE FROM list_snapshots WHERE listId = ?`, *id); err != nil {
-			return result, fmt.Errorf("%s: list_snapshots: %w", op, err)
-		}
+		result.CardRows += n
 	}
 
 	if _, err := tx.ExecContext(ctx, `DELETE FROM deckbox_users WHERE deckboxLogin = ?`, login); err != nil {

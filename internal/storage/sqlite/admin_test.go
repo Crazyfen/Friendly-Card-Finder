@@ -5,6 +5,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
+	"log/slog"
 	"math/rand/v2"
 	"slices"
 	"testing"
@@ -411,5 +413,78 @@ func BenchmarkAdminInsights(b *testing.B) {
 		if _, err := s.AdminInsights(ctx); err != nil {
 			b.Fatalf("admin insights: %v", err)
 		}
+	}
+}
+
+// listRows counts what storage still holds for one Card List: card rows, FTS
+// rows and the stored hash.
+func listRows(t *testing.T, s *SQLiteStorage, id int64) (cards, fts, hashes int) {
+	t.Helper()
+	ctx := context.Background()
+	if err := s.db.readDB.QueryRowContext(ctx, `SELECT COUNT(*) FROM card_lists WHERE listId = ?`, id).Scan(&cards); err != nil {
+		t.Fatal(err)
+	}
+	if s.ftsEnabled {
+		if err := s.db.readDB.QueryRowContext(ctx, `SELECT COUNT(*) FROM card_lists_fts WHERE card_lists_fts MATCH ?`, ftsListIdQuery(id)).Scan(&fts); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := s.db.readDB.QueryRowContext(ctx, `SELECT COUNT(*) FROM card_list_hashes WHERE listId = ?`, id).Scan(&hashes); err != nil {
+		t.Fatal(err)
+	}
+	return cards, fts, hashes
+}
+
+func TestSaveDeckboxUserDeletesAListThatWentPrivate(t *testing.T) {
+	// The profile stops showing a list its owner made private. The bot must
+	// not keep the copy it already has (docs/adr/0009).
+	ctx := context.Background()
+	s := newTestDB(t)
+	seedUser(t, s, "petya", 100, false) // lists 101, 102, 103
+	if err := s.SaveCardList(ctx, deckbox.CardList{ListId: 101, Cards: map[string]int16{"Shock": 1}, BodyHash: 7}); err != nil {
+		t.Fatal(err)
+	}
+
+	trade, wish := int64(102), int64(103)
+	if err := s.SaveDeckboxUser(ctx, deckbox.DeckboxUser{DeckboxLogin: "petya", TradelistID: &trade, WishlistID: &wish}); err != nil {
+		t.Fatal(err)
+	}
+
+	if c, f, h := listRows(t, s, 101); c+f+h != 0 {
+		t.Errorf("private list 101 kept %d card rows, %d FTS rows, %d hashes", c, f, h)
+	}
+	if c, _, _ := listRows(t, s, 102); c != 2 {
+		t.Errorf("list 102 still shown on the profile lost its rows: %d left", c)
+	}
+}
+
+func TestNewDeletesUnreferencedLists(t *testing.T) {
+	// Lists that went private before SaveDeckboxUser deleted them are still on
+	// disk with no Deckbox User pointing at them; opening storage clears them.
+	ctx := context.Background()
+	path := t.TempDir() + "/test.db"
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	s, err := New(path, log, defaultCardBatchSize)
+	if err != nil {
+		t.Fatal(err)
+	}
+	seedUser(t, s, "petya", 100, false)
+	if err := s.SaveCardList(ctx, deckbox.CardList{ListId: 999, Cards: map[string]int16{"Shock": 1}, BodyHash: 7}); err != nil {
+		t.Fatal(err)
+	}
+	s.Close()
+
+	s, err = New(path, log, defaultCardBatchSize)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { s.Close() })
+
+	if c, f, h := listRows(t, s, 999); c+f+h != 0 {
+		t.Errorf("unreferenced list 999 kept %d card rows, %d FTS rows, %d hashes", c, f, h)
+	}
+	if c, _, _ := listRows(t, s, 101); c != 2 {
+		t.Errorf("referenced list 101 lost its rows: %d left", c)
 	}
 }

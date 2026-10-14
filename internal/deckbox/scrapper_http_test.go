@@ -2,6 +2,7 @@ package deckbox
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -29,6 +30,10 @@ type fakeDeckbox struct {
 	// failExports makes the first N export attempts answer 500, to exercise the
 	// retry.
 	failExports int64
+
+	// privateExports makes every export answer 404, as Deckbox does for a
+	// Card List its owner made private.
+	privateExports bool
 
 	// loginPostStatus is what the credential POST answers with. 302 is success;
 	// 200 means Deckbox re-rendered the form, i.e. bad credentials.
@@ -58,6 +63,11 @@ func newFakeDeckbox(t *testing.T) *fakeDeckbox {
 	})
 
 	mux.HandleFunc("/sets/", func(w http.ResponseWriter, r *http.Request) {
+		if f.privateExports {
+			f.exports.Add(1)
+			http.NotFound(w, r)
+			return
+		}
 		if n := f.exports.Add(1); n <= f.failExports {
 			w.WriteHeader(http.StatusInternalServerError)
 			return
@@ -119,6 +129,22 @@ func TestFetchCardListLogsInAndParses(t *testing.T) {
 	}
 	if got := f.logins.Load(); got != 1 {
 		t.Errorf("logins = %d, want 1 — a cold start logs in once", got)
+	}
+}
+
+func TestFetchCardListReportsAPrivateListWithoutRetrying(t *testing.T) {
+	// A 404 is the owner's decision, not a transient fault: retrying it only
+	// costs Deckbox two more renders of a page that will not appear.
+	f := newFakeDeckbox(t)
+	f.privateExports = true
+	s := scraperAgainst(t, f)
+
+	_, err := s.FetchCardList(context.Background(), 222)
+	if !errors.Is(err, ErrNotFound) {
+		t.Fatalf("err = %v, want ErrNotFound", err)
+	}
+	if got := f.exports.Load(); got != 1 {
+		t.Errorf("export requests = %d, want 1", got)
 	}
 }
 

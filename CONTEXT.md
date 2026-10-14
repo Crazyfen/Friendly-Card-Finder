@@ -8,6 +8,8 @@ The names this project uses for its own concepts. Architecture and conventions l
 
 **Card List** — one of a Deckbox User's three lists (inventory, tradelist, wishlist), identified by its Deckbox `listId`. Holds card name → quantity. `BodyHash` is the hash of the export it was parsed from, used to skip unchanged saves.
 
+**Private Card List** — a Card List its owner hid on Deckbox: the profile stops showing it, or its export answers "not found". The bot holds no copy of a Private Card List — its cards are deleted at the Refresh that notices, and the Refresh still succeeds. Deckbox being unreachable is not privacy: a failed fetch keeps the last copy. If the owner makes it public again, the next Refresh reads it as new.
+
 **Quantity** — how many copies of a card name a Card List holds, summed across every printing of it. The export page carries no variation data (set, printing, foil), so a name appearing on several lines is the same card in different variations and the lines are added together. This is deliberate: the quantities are not duplicates to be de-duplicated, and there is no per-variation number to recover.
 
 **Scope** — which of the three Card Lists a search runs against: `tradelist` (plain text search), `wishlist` (`/sell`), or `inventory`. A named type, not a bare string, because both the storage column and the Telegram wording default to the tradelist when they do not recognise the value.
@@ -24,7 +26,7 @@ The names this project uses for its own concepts. Architecture and conventions l
 
 **Session** — the Deckbox `_tcg_session` cookie the scraper authenticates with, and the rules around it: where it may come from, when it is replaced, and that one rejection causes one login however many workers noticed it.
 
-**Refresh** — re-scraping a Deckbox User's profile and all three Card Lists, then stamping `updated_at`. There is exactly one implementation (`Deckbox.refreshUser`); registration, the background ticker and `/suggestdeckbox` all go through it. A Refresh succeeds when the profile was read and stored — an empty collection is a legitimate answer, not a failure. Only a Deckbox User who could not be read at all stays stale.
+**Refresh** — re-scraping a Deckbox User's profile and all three Card Lists, then stamping `updated_at`. There is exactly one implementation (`Deckbox.refreshUser`); registration, the background ticker and `/suggestdeckbox` all go through it. A Refresh succeeds when the profile was read and stored — an empty collection is a legitimate answer, not a failure. Only a Deckbox User who could not be read at all stays stale. A Card List found to be private is deleted, not counted as a failure.
 
 **Suggest** — the `/suggestdeckbox` bulk Refresh, which skips any Deckbox User whose data is still fresh.
 

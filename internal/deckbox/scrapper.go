@@ -3,6 +3,7 @@ package deckbox
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"hash/fnv"
 	"html"
@@ -18,6 +19,10 @@ import (
 )
 
 const sessionCookieName = "_tcg_session"
+
+// ErrNotFound is a Deckbox page answering 404. For a Card List export that
+// means its owner made it private (see Private Card List in CONTEXT.md).
+var ErrNotFound = errors.New("deckbox: not found")
 
 const scraperUserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/58.0.3029.110 Safari/537.3"
 
@@ -38,7 +43,7 @@ func (s *Scraper) fetchPage(ctx context.Context, pageURL, cookie string, log *sl
 		if err == nil {
 			return body, finalURL, nil
 		}
-		if i == maxAttempts-1 {
+		if errors.Is(err, ErrNotFound) || i == maxAttempts-1 {
 			break // no point backing off before giving up
 		}
 		log.Warn("fetch failed, retrying", slog.String("url", pageURL), slog.Int("attempt", i+1), slog.String("error", err.Error()))
@@ -71,6 +76,9 @@ func (s *Scraper) fetchPageOnce(ctx context.Context, pageURL, cookie string) ([]
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return nil, nil, err
+	}
+	if resp.StatusCode == http.StatusNotFound {
+		return nil, nil, fmt.Errorf("%w: %s", ErrNotFound, pageURL)
 	}
 	if resp.StatusCode != http.StatusOK {
 		return nil, nil, fmt.Errorf("unexpected status %d for %s", resp.StatusCode, pageURL)

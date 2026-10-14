@@ -3,6 +3,7 @@ package deckbox
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"sync"
 	"testing"
@@ -26,6 +27,7 @@ type fakeStorage struct {
 
 	mu                    sync.Mutex // Search runs its queries concurrently
 	saveCardListCalls     int
+	lastSavedList         CardList
 	outcomeCalls          int
 	UpdateTimestampCalled bool
 	lastSearchName        string
@@ -40,6 +42,7 @@ func (f *fakeStorage) SaveDeckboxUser(ctx context.Context, user DeckboxUser) err
 func (f *fakeStorage) SaveCardList(ctx context.Context, list CardList) error {
 	f.mu.Lock()
 	f.saveCardListCalls++
+	f.lastSavedList = list
 	f.mu.Unlock()
 	return f.saveCardListErr
 }
@@ -149,6 +152,8 @@ type fakeScraper struct {
 	// emptyLists makes every Card List come back with no cards, which is what a
 	// Deckbox User who has not filled in their collection actually looks like.
 	emptyLists bool
+	// privateLists makes every export answer 404, as a Private Card List does.
+	privateLists bool
 }
 
 func (f *fakeScraper) FetchDeckboxUserProfile(ctx context.Context, login string) (DeckboxUser, error) {
@@ -162,6 +167,9 @@ func (f *fakeScraper) FetchDeckboxUserProfile(ctx context.Context, login string)
 func (f *fakeScraper) FetchCardList(ctx context.Context, listId int64) (CardList, error) {
 	if f.fetchErr != nil {
 		return CardList{}, f.fetchErr
+	}
+	if f.privateLists {
+		return CardList{}, fmt.Errorf("fetch export: %w", ErrNotFound)
 	}
 	if f.emptyLists {
 		return CardList{ListId: listId, Cards: map[string]int16{}}, nil
@@ -259,6 +267,12 @@ func TestRefreshUserReportsWhatHappened(t *testing.T) {
 			storage: &fakeStorage{}, scraper: &fakeScraper{},
 			wantSaved: true, wantErr: false, wantCards: 1,
 		},
+		{
+			// The owner hid the list: a decision, not a failure.
+			name:    "card list is private",
+			storage: &fakeStorage{}, scraper: &fakeScraper{privateLists: true},
+			wantSaved: true, wantErr: false, wantCards: 0,
+		},
 	}
 
 	for _, tt := range tests {
@@ -282,6 +296,23 @@ func TestRefreshUserReportsWhatHappened(t *testing.T) {
 				t.Error("refreshUser must not record the outcome")
 			}
 		})
+	}
+}
+
+func TestRefreshUserDeletesPrivateCardList(t *testing.T) {
+	// A 404 export must clear what the bot holds, not leave the last copy
+	// searchable: the save of an empty list is what deletes it.
+	storage := &fakeStorage{}
+	out := newTestDeckbox(storage, &fakeScraper{privateLists: true}).refreshUser(context.Background(), slog.Default(), "petya")
+
+	if got := storage.saveCalls(); got != 1 {
+		t.Errorf("SaveCardList calls = %d, want 1 (the deletion)", got)
+	}
+	if storage.lastSavedList.ListId != 1 || len(storage.lastSavedList.Cards) != 0 || storage.lastSavedList.BodyHash != 0 {
+		t.Errorf("saved %+v, want list 1 empty with no hash", storage.lastSavedList)
+	}
+	if len(out.Lists) != 0 {
+		t.Errorf("a private list must not be reported as a list size: %+v", out.Lists)
 	}
 }
 
