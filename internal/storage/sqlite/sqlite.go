@@ -574,7 +574,10 @@ func (s *SQLiteStorage) SearchCard(ctx context.Context, q deckbox.Query) ([]deck
 //     so it is UNINDEXED to keep the index small and writes fast.
 //   - quantity is stored (UNINDEXED) so a search reads everything from the FTS
 //     table directly instead of joining every matched row back to card_lists.
-const ftsColumnSpec = `(listId, cardName UNINDEXED, cardName_normalized, quantity UNINDEXED)`
+//   - prefix='1 2' keeps ready-made indexes for one- and two-character
+//     prefixes, the queries ("a", "of") whose prefix scan otherwise merges the
+//     most terms.
+const ftsColumnSpec = `(listId, cardName UNINDEXED, cardName_normalized, quantity UNINDEXED, prefix='1 2')`
 
 // The table uses the default unicode61 tokenizer. queryTokens mirrors its
 // token boundaries in Go for phrase queries and canonical comparison — any
