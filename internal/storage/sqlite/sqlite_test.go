@@ -8,6 +8,7 @@ import (
 	"io"
 	"log/slog"
 	"os"
+	"reflect"
 	"sort"
 	"strings"
 	"testing"
@@ -1172,6 +1173,76 @@ func TestMigrationKeepsTelegramRegistrations(t *testing.T) {
 	}
 	if platform != "telegram" || userID != 7 || username != "petya" || login != "petya" || createdAt != 1700000000 {
 		t.Errorf("got (%s, %d, %s, %s, %d)", platform, userID, username, login, createdAt)
+	}
+}
+
+func TestMigrationMergesLoginsDifferingByCase(t *testing.T) {
+	db, err := sql.Open(driverName, buildDSN(t.TempDir()+"/migrate.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	db.SetMaxOpenConns(1)
+
+	goose.SetBaseFS(embedMigrations)
+	goose.SetLogger(goose.NopLogger())
+	if err := goose.SetDialect("sqlite3"); err != nil {
+		t.Fatal(err)
+	}
+	if err := goose.UpTo(db, "migrations", 8); err != nil {
+		t.Fatalf("migrate to 8: %v", err)
+	}
+	// alexvoron is claimed on Telegram, so it beats the fresher AlexVoron, whose
+	// only claim is on Discord. Nobody claims either petya, so the fresher one
+	// wins. Two Telegram users claimed the login in different case: the earlier
+	// claim wins. The Discord claim is a different Platform and survives.
+	if _, err := db.Exec(`
+		INSERT INTO deckbox_users(deckboxLogin, inventoryId, updated_at) VALUES
+			('alexvoron', 1, 100), ('AlexVoron', 2, 200), ('Petya', 3, 50), ('petya', 4, 10);
+		INSERT INTO users(platform, userId, username, deckboxLogin, created_at) VALUES
+			('telegram', 7, 'late', 'alexvoron', 300),
+			('telegram', 8, 'early', 'ALEXVORON', 200),
+			('discord', 9, 'dc', 'AlexVoron', 400)`); err != nil {
+		t.Fatal(err)
+	}
+	if err := goose.Up(db, "migrations"); err != nil {
+		t.Fatalf("migrate to latest: %v", err)
+	}
+
+	got := map[string]int64{}
+	rows, err := db.Query(`SELECT deckboxLogin, inventoryId FROM deckbox_users`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for rows.Next() {
+		var login string
+		var id int64
+		if err := rows.Scan(&login, &id); err != nil {
+			t.Fatal(err)
+		}
+		got[login] = id
+	}
+	rows.Close()
+	if want := map[string]int64{"alexvoron": 1, "petya": 3};!reflect.DeepEqual(got, want) {
+		t.Errorf("deckbox_users = %v, want %v", got, want)
+	}
+
+	claims := map[string]int64{}
+	rows, err = db.Query(`SELECT platform, userId, deckboxLogin FROM users`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for rows.Next() {
+		var platform, login string
+		var id int64
+		if err := rows.Scan(&platform, &id, &login); err != nil {
+			t.Fatal(err)
+		}
+		claims[platform+"/"+login] = id
+	}
+	rows.Close()
+	if want := map[string]int64{"telegram/alexvoron": 8, "discord/alexvoron": 9}; !reflect.DeepEqual(claims, want) {
+		t.Errorf("users = %v, want %v", claims, want)
 	}
 }
 

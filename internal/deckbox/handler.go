@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"regexp"
 	"sort"
 	"strings"
 	"sync"
@@ -44,6 +45,28 @@ func New(log *slog.Logger, storage DeckboxSaver, admin AdminStore, scraper Fetch
 	}
 }
 
+// ErrInvalidLogin is a login that cannot be a Deckbox username. Scraping one
+// still "succeeds" — Deckbox answers with an empty profile — and leaves a
+// Deckbox User with no lists behind, so it is refused before any fetch.
+var ErrInvalidLogin = errors.New("invalid Deckbox login")
+
+// loginPattern is what a Deckbox username looks like in a /users/<login> URL.
+// It rules out the usual paste mistakes: a Telegram @handle, an empty line,
+// or a line carrying more than the login ("name — deckbox").
+var loginPattern = regexp.MustCompile(`^[a-z0-9_.-]{1,64}$`)
+
+// ParseLogin turns user input into the stored form of a Deckbox login, or
+// ErrInvalidLogin. Deckbox usernames are case-insensitive, so the login is
+// lowercased: "AlexVoron" and "alexvoron" are one Deckbox User, never two rows
+// scraping the same profile.
+func ParseLogin(raw string) (string, error) {
+	login := strings.ToLower(strings.TrimSpace(raw))
+	if !loginPattern.MatchString(login) {
+		return "", ErrInvalidLogin
+	}
+	return login, nil
+}
+
 // Registration is the input for /deckbox, carrying only what the domain needs.
 type Registration struct {
 	Platform     Platform
@@ -59,6 +82,13 @@ func (d *Deckbox) Register(ctx context.Context, r Registration) error {
 	log := d.log.With(slog.String("operation", op), slog.String("deckbox_id", r.DeckboxLogin))
 
 	log.Info("registering user", slog.String("platform", string(r.Platform)), slog.String("username", r.Handle))
+
+	login, err := ParseLogin(r.DeckboxLogin)
+	if err != nil {
+		log.Info("rejected invalid login")
+		return err
+	}
+	r.DeckboxLogin = login
 
 	if err := d.storage.RegisterUser(ctx, BotUser{
 		Platform:     r.Platform,
@@ -278,8 +308,20 @@ func (d *Deckbox) Suggest(ctx context.Context, logins []string) SuggestResult {
 	// avoids races on result.Errors / result.SkippedCount inside worker goroutines.
 	freshnessLimit := time.Duration(d.freshnessHours) * time.Hour
 	toProcess := make([]string, 0, len(logins))
-	for _, login := range logins {
-		login = strings.TrimSpace(login)
+	seen := make(map[string]bool, len(logins))
+	for _, raw := range logins {
+		if strings.TrimSpace(raw) == "" {
+			continue
+		}
+		login, err := ParseLogin(raw)
+		if err != nil {
+			result.Errors = append(result.Errors, fmt.Sprintf("%q: %v", strings.TrimSpace(raw), err))
+			continue
+		}
+		if seen[login] {
+			continue
+		}
+		seen[login] = true
 		existingUser, err := d.storage.GetDeckboxUser(ctx, login)
 		if err != nil {
 			log.Error("failed to get existing user", sl.Err(err))

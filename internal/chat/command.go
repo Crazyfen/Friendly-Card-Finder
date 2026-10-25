@@ -6,6 +6,7 @@ import (
 	"FriendlyCardFinder/internal/lib/logger/sl"
 	"FriendlyCardFinder/internal/message"
 	"context"
+	"errors"
 	"log/slog"
 	"strconv"
 	"strings"
@@ -147,7 +148,9 @@ func (c *Commands) Register(ctx context.Context, req Request) []Reply {
 		UserID:       req.UserID,
 		Handle:       req.Username,
 		DeckboxLogin: login,
-	}); err != nil {
+	}); errors.Is(err, deckbox.ErrInvalidLogin) {
+		return []Reply{{Message: i18n.Format(req.Lang, "deckbox.register_bad_login", message.Text(login)), Private: true}}
+	} else if err != nil {
 		return []Reply{{Message: i18n.Format(req.Lang, "deckbox.register_error"), Private: true}}
 	}
 
@@ -168,7 +171,14 @@ func (c *Commands) Suggest(req Request) (Reply, func(context.Context) Reply) {
 		return Reply{Message: i18n.Format(req.Lang, "suggest.no_argument"), Private: true}, nil
 	}
 
-	logins := strings.Split(req.Text, "\n")
+	// Blank lines are not logins: they would be counted in the acknowledgement
+	// and, before ValidLogin, were scraped as a Deckbox User with an empty name.
+	var logins []string
+	for line := range strings.SplitSeq(req.Text, "\n") {
+		if line = strings.TrimSpace(line); line != "" {
+			logins = append(logins, line)
+		}
+	}
 	ack := Reply{Message: i18n.Format(req.Lang, "suggest.ack", count(len(logins))), Private: true}
 
 	return ack, func(ctx context.Context) Reply {

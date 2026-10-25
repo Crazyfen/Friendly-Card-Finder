@@ -202,6 +202,11 @@ func (d *Deckbox) Unlink(ctx context.Context, platform Platform, userID int64) e
 func (d *Deckbox) RefreshNow(ctx context.Context, login string) error {
 	const op = "deckbox.RefreshNow"
 
+	login, err := ParseLogin(login)
+	if err != nil {
+		return err
+	}
+
 	results := d.refreshUsers(ctx, []string{login}, 1)
 	if len(results) == 0 {
 		return fmt.Errorf("%s: no result for %s", op, login)

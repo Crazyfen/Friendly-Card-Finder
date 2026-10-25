@@ -228,6 +228,28 @@ func TestSuggestAcknowledgesThenSummarises(t *testing.T) {
 	}
 }
 
+func TestSuggestDropsBlankLines(t *testing.T) {
+	dbx := &fakeDomain{}
+	ack, run := newTestCommands(dbx).Suggest(req("petya\n\n  \nmasha\n"))
+	run(context.Background())
+
+	if !reflect.DeepEqual(dbx.suggested, []string{"petya", "masha"}) {
+		t.Errorf("suggested %q, want the blank lines dropped", dbx.suggested)
+	}
+	if got := ack.Message.PlainText(); got != "Starting processing of 2 logins..." {
+		t.Errorf("ack = %q, must not count blank lines", got)
+	}
+}
+
+func TestRegisterInvalidLoginExplainsTheRule(t *testing.T) {
+	dbx := &fakeDomain{registerErr: deckbox.ErrInvalidLogin}
+	replies := newTestCommands(dbx).Register(context.Background(), req("@petya"))
+
+	if len(replies) != 1 || !strings.HasPrefix(replies[0].Message.PlainText(), "@petya doesn't look like a Deckbox login") {
+		t.Fatalf("expected the invalid-login message, got %+v", replies)
+	}
+}
+
 func TestSuggestWithoutLoginsRunsNothing(t *testing.T) {
 	dbx := &fakeDomain{}
 	ack, run := newTestCommands(dbx).Suggest(req(" "))

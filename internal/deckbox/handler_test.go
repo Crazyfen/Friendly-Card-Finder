@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"reflect"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -231,6 +233,28 @@ func TestRegisterReturnsStorageError(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error when RegisterUser fails")
 	}
+}
+
+func TestRegisterLowercasesTheLogin(t *testing.T) {
+	storage := &claimStorage{}
+	d := newTestDeckbox(storage, &fakeScraper{})
+	if err := d.Register(context.Background(), Registration{Platform: PlatformTelegram, UserID: 1, DeckboxLogin: "AlexVoron"}); err != nil {
+		t.Fatal(err)
+	}
+	if storage.claimed != "alexvoron" {
+		t.Errorf("registered %q, want the lowercased login", storage.claimed)
+	}
+}
+
+// claimStorage records the login a registration claims.
+type claimStorage struct {
+	fakeStorage
+	claimed string
+}
+
+func (c *claimStorage) RegisterUser(ctx context.Context, user BotUser) error {
+	c.claimed = user.DeckboxLogin
+	return nil
 }
 
 // errorStorage fails registration and nothing else.
@@ -725,6 +749,54 @@ func TestSuggestStaleUserIsProcessed(t *testing.T) {
 	}
 	if result.ProcessedCount != 1 {
 		t.Errorf("expected 1 processed, got %d", result.ProcessedCount)
+	}
+}
+
+func TestSuggestRejectsInvalidLogins(t *testing.T) {
+	// The pastes that left empty Deckbox Users in production: a Telegram handle
+	// with a trailing note, and a blank line. Neither may reach storage or the
+	// scraper; a duplicate is refreshed once.
+	var looked []string
+	storage := &fakeStorage{
+		getDeckboxUserFn: func(_ context.Context, login string) (*DeckboxUser, error) {
+			looked = append(looked, login)
+			return nil, nil
+		},
+	}
+	d := newTestDeckbox(storage, &fakeScraper{})
+	result := d.Suggest(context.Background(), []string{"@x_GS_x — deckbox", "", "  ", "alexey_g", "Alexey_G", "a.b-c"})
+
+	if !reflect.DeepEqual(looked, []string{"alexey_g", "a.b-c"}) {
+		t.Errorf("looked up %q, want only the valid logins, lowercased and distinct", looked)
+	}
+	if result.ProcessedCount != 2 {
+		t.Errorf("expected 2 processed, got %d", result.ProcessedCount)
+	}
+	if len(result.Errors) != 1 || !strings.Contains(result.Errors[0], "@x_GS_x") {
+		t.Errorf("expected one error naming the bad line, got %q", result.Errors)
+	}
+}
+
+func TestParseLogin(t *testing.T) {
+	for raw, want := range map[string]string{
+		"alexey_g": "alexey_g", " AfkAlex ": "afkalex", "a.b-c": "a.b-c", "x_GS_x": "x_gs_x",
+	} {
+		if got, err := ParseLogin(raw); err != nil || got != want {
+			t.Errorf("ParseLogin(%q) = %q, %v; want %q", raw, got, err, want)
+		}
+	}
+	for _, raw := range []string{"", "@x_GS_x", "x_GS_x — deckbox", "two words", "логин"} {
+		if _, err := ParseLogin(raw); !errors.Is(err, ErrInvalidLogin) {
+			t.Errorf("ParseLogin(%q) err = %v, want ErrInvalidLogin", raw, err)
+		}
+	}
+}
+
+func TestRegisterRejectsInvalidLogin(t *testing.T) {
+	d := newTestDeckbox(&fakeStorage{}, &fakeScraper{})
+	err := d.Register(context.Background(), Registration{Platform: PlatformTelegram, UserID: 1, DeckboxLogin: "@petya"})
+	if !errors.Is(err, ErrInvalidLogin) {
+		t.Errorf("err = %v, want ErrInvalidLogin", err)
 	}
 }
 
