@@ -1,6 +1,6 @@
 {{define "content"}}
 <h2>Purge {{.Login}}?</h2>
-<p class="sub">This removes the collection, every card row in its three lists, the search index entries, the size history, and the Telegram registration claiming this login. It cannot be undone — the data comes back only by scraping Deckbox again.</p>
+<p class="sub">This removes the collection, every card row in its three lists, the search index entries, the size history, and every registration claiming this login. It cannot be undone — the data comes back only by scraping Deckbox again.</p>
 
 <div class="tiles">
   <div class="tile"><div class="label">Inventory</div><div class="value">{{.Inventory}}</div><div class="note">rows</div></div>
@@ -9,7 +9,7 @@
   <div class="tile {{if .HasRegistration}}bad{{end}}">
     <div class="label">Registration</div>
     <div class="value">{{if .HasRegistration}}yes{{else}}none{{end}}</div>
-    <div class="note">{{.Telegram}}</div>
+    <div class="note">{{.Contacts}}</div>
   </div>
 </div>
 

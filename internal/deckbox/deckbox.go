@@ -8,10 +8,28 @@ import (
 	"time"
 )
 
+// Platform is the chat service a Bot User talks to the bot through. A Bot User
+// belongs to exactly one — see docs/adr/0011.
+type Platform string
+
+const (
+	PlatformTelegram Platform = "telegram"
+	PlatformDiscord  Platform = "discord"
+)
+
+// Contact is a way to reach a Deckbox login's claimant on one Platform. Handle
+// is nil when the account has none.
+type Contact struct {
+	Platform Platform
+	UserID   int64
+	Handle   *string
+}
+
 type BotUser struct {
-	TelegramID       int64
-	TelegramUsername string
-	DeckboxLogin     string
+	Platform     Platform
+	UserID       int64
+	Handle       string
+	DeckboxLogin string
 }
 
 type DeckboxUser struct {
@@ -32,9 +50,7 @@ type CardList struct {
 
 type CardListWithOwner struct {
 	CardList
-	DeckboxLogin     string
-	TelegramID       *int64
-	TelegramUsername *string
+	DeckboxLogin string
 }
 
 // Scope is which of a Deckbox User's three Card Lists an operation runs
@@ -56,13 +72,12 @@ type Query struct {
 // UserSearchAggregate is one Card List's contribution to a search: every
 // queried card it holds, plus the counts the ranking sorts on.
 type UserSearchAggregate struct {
-	ListId           int64
-	DeckboxLogin     string
-	TelegramID       *int64
-	TelegramUsername *string
-	FoundCards       map[string]int16
-	UniqueCount      int
-	TotalQuantity    int
+	ListId        int64
+	DeckboxLogin  string
+	Contacts      []Contact
+	FoundCards    map[string]int16
+	UniqueCount   int
+	TotalQuantity int
 }
 
 // SearchResult is the outcome of one search over 1..n card names. A single-card
@@ -93,6 +108,9 @@ type DeckboxSaver interface {
 	SaveDeckboxUser(ctx context.Context, user DeckboxUser) error
 	SaveCardList(ctx context.Context, list CardList) error
 	SearchCard(ctx context.Context, q Query) ([]CardListWithOwner, error)
+	// ContactsFor returns each login's claimants, ordered by (platform, userId).
+	// A login nobody claimed has no key.
+	ContactsFor(ctx context.Context, logins []string) (map[string][]Contact, error)
 	GetDeckboxUser(ctx context.Context, deckboxLogin string) (*DeckboxUser, error)
 	SaveRefreshOutcome(ctx context.Context, outcome RefreshOutcome) error
 	GetAllDeckboxUsersWithOldLists(ctx context.Context, thresholdSeconds int64) ([]string, error)
@@ -108,7 +126,7 @@ type DeckboxSaver interface {
 // their tests — have to cross. One implementation satisfies both.
 type AdminStore interface {
 	PurgeDeckboxUser(ctx context.Context, deckboxLogin string) (PurgeResult, error)
-	UnlinkBotUser(ctx context.Context, deckboxLogin string) error
+	UnlinkBotUser(ctx context.Context, platform Platform, userID int64) error
 	AdminOverview(ctx context.Context, staleThreshold int64) (Overview, error)
 	AdminUsers(ctx context.Context) ([]AdminUser, error)
 	AdminInsights(ctx context.Context) (Insights, error)

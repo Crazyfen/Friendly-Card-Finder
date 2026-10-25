@@ -54,23 +54,22 @@ type PurgeResult struct {
 // OrphanRegistration is a Bot User whose claimed login has no Deckbox User —
 // a login that never produced a collection, so search can never return it.
 type OrphanRegistration struct {
-	TelegramID       int64
-	TelegramUsername *string
-	DeckboxLogin     string
+	Contact      Contact
+	DeckboxLogin string
 }
 
-// AdminUser is one row of the Admin Panel's manage table.
+// AdminUser is one row of the Admin Panel's manage table. Contacts holds every
+// Bot User claiming the login, across Platforms.
 type AdminUser struct {
-	DeckboxLogin     string
-	TelegramID       *int64
-	TelegramUsername *string
-	InventoryCount   int
-	TradelistCount   int
-	WishlistCount    int
-	MissingLists     int
-	UpdatedAt        *int64
-	LastError        string
-	LastCardCount    *int64
+	DeckboxLogin   string
+	Contacts       []Contact
+	InventoryCount int
+	TradelistCount int
+	WishlistCount  int
+	MissingLists   int
+	UpdatedAt      *int64
+	LastError      string
+	LastCardCount  *int64
 }
 
 // Overview is the Admin Panel's stat strip. It carries only what AdminUsers
@@ -182,13 +181,14 @@ func (d *Deckbox) recordDemand(ctx context.Context, log *slog.Logger, queries []
 	}()
 }
 
-// Unlink removes the Bot User registration claiming a login, leaving the
-// Deckbox User and its Card Lists in place.
-func (d *Deckbox) Unlink(ctx context.Context, login string) error {
+// Unlink removes one Bot User's registration, leaving the Deckbox User, its Card
+// Lists and any other claimant of the login in place.
+func (d *Deckbox) Unlink(ctx context.Context, platform Platform, userID int64) error {
 	const op = "deckbox.Unlink"
-	log := d.log.With(slog.String("operation", op), slog.String("deckbox_id", login))
+	log := d.log.With(slog.String("operation", op),
+		slog.String("platform", string(platform)), slog.Int64("user_id", userID))
 
-	if err := d.admin.UnlinkBotUser(ctx, login); err != nil {
+	if err := d.admin.UnlinkBotUser(ctx, platform, userID); err != nil {
 		log.Error("failed to unlink registration", sl.Err(err))
 		return err
 	}

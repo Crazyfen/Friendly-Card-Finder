@@ -3,6 +3,7 @@ package sqlite
 import (
 	"FriendlyCardFinder/internal/deckbox"
 	"context"
+	"database/sql"
 	"fmt"
 	"io"
 	"log/slog"
@@ -11,6 +12,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/pressly/goose/v3"
 )
 
 // newTestDB creates a SQLiteStorage backed by a temp file and registers cleanup.
@@ -556,7 +559,7 @@ func TestSearchCardGroupsByOwner(t *testing.T) {
 	if err := storage.SaveDeckboxUser(ctx, deckbox.DeckboxUser{DeckboxLogin: "bob", TradelistID: &bobList}); err != nil {
 		t.Fatalf("failed to save bob: %v", err)
 	}
-	if err := storage.RegisterUser(ctx, deckbox.BotUser{TelegramID: 42, TelegramUsername: "alice_tg", DeckboxLogin: "alice"}); err != nil {
+	if err := storage.RegisterUser(ctx, deckbox.BotUser{Platform: deckbox.PlatformTelegram, UserID: 42, Handle: "alice_tg", DeckboxLogin: "alice"}); err != nil {
 		t.Fatalf("failed to register alice: %v", err)
 	}
 	if err := storage.SaveCardList(ctx, deckbox.CardList{
@@ -595,13 +598,6 @@ func TestSearchCardGroupsByOwner(t *testing.T) {
 	if alice.ListId != aliceList {
 		t.Errorf("alice's group: want listId %d, got %d", aliceList, alice.ListId)
 	}
-	// A registered Bot User's Telegram identity rides along on the group.
-	if alice.TelegramID == nil || *alice.TelegramID != 42 {
-		t.Errorf("alice's group: want telegram id 42, got %v", alice.TelegramID)
-	}
-	if alice.TelegramUsername == nil || *alice.TelegramUsername != "alice_tg" {
-		t.Errorf("alice's group: want telegram username, got %v", alice.TelegramUsername)
-	}
 
 	bob, ok := byLogin["bob"]
 	if !ok {
@@ -609,10 +605,6 @@ func TestSearchCardGroupsByOwner(t *testing.T) {
 	}
 	if len(bob.Cards) != 1 || bob.Cards["Lightning Bolt"] != 2 {
 		t.Errorf("bob's group: want Lightning Bolt=2, got %v", bob.Cards)
-	}
-	// Bob never registered with the bot, so there is no Telegram identity.
-	if bob.TelegramID != nil || bob.TelegramUsername != nil {
-		t.Errorf("bob's group: want no telegram identity, got %v/%v", bob.TelegramID, bob.TelegramUsername)
 	}
 }
 
@@ -741,9 +733,10 @@ func TestRegisterUser(t *testing.T) {
 	t.Run("success", func(t *testing.T) {
 		s := newTestDB(t)
 		err := s.RegisterUser(ctx, deckbox.BotUser{
-			TelegramID:       1001,
-			TelegramUsername: "alice",
-			DeckboxLogin:     "alice_deckbox",
+			Platform:     deckbox.PlatformTelegram,
+			UserID:       1001,
+			Handle:       "alice",
+			DeckboxLogin: "alice_deckbox",
 		})
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
@@ -752,7 +745,7 @@ func TestRegisterUser(t *testing.T) {
 
 	t.Run("duplicate returns error", func(t *testing.T) {
 		s := newTestDB(t)
-		user := deckbox.BotUser{TelegramID: 1002, TelegramUsername: "bob", DeckboxLogin: "bob_deckbox"}
+		user := deckbox.BotUser{Platform: deckbox.PlatformTelegram, UserID: 1002, Handle: "bob", DeckboxLogin: "bob_deckbox"}
 		if err := s.RegisterUser(ctx, user); err != nil {
 			t.Fatalf("first insert failed: %v", err)
 		}
@@ -1137,5 +1130,121 @@ func BenchmarkBuildFtsQueryTerm(b *testing.B) {
 	b.ReportAllocs()
 	for i := 0; i < b.N; i++ {
 		_ = buildFtsQueryTerm("Vitu-Ghazi Inspector")
+	}
+}
+
+// --- Bot Users per Platform (docs/adr/0011) ---
+
+const (
+	discordA = int64(900000000000000001)
+	discordB = int64(900000000000000002)
+)
+
+func TestMigrationKeepsTelegramRegistrations(t *testing.T) {
+	db, err := sql.Open(driverName, buildDSN(t.TempDir()+"/migrate.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	db.SetMaxOpenConns(1)
+
+	goose.SetBaseFS(embedMigrations)
+	goose.SetLogger(goose.NopLogger())
+	if err := goose.SetDialect("sqlite3"); err != nil {
+		t.Fatal(err)
+	}
+	if err := goose.UpTo(db, "migrations", 7); err != nil {
+		t.Fatalf("migrate to 7: %v", err)
+	}
+	if _, err := db.Exec(`INSERT INTO users(telegramId, username, deckboxLogin, created_at)
+		VALUES (7, 'petya', 'petya', 1700000000)`); err != nil {
+		t.Fatal(err)
+	}
+	if err := goose.Up(db, "migrations"); err != nil {
+		t.Fatalf("migrate to latest: %v", err)
+	}
+
+	var platform, username, login string
+	var userID, createdAt int64
+	if err := db.QueryRow(`SELECT platform, userId, username, deckboxLogin, created_at FROM users`).
+		Scan(&platform, &userID, &username, &login, &createdAt); err != nil {
+		t.Fatal(err)
+	}
+	if platform != "telegram" || userID != 7 || username != "petya" || login != "petya" || createdAt != 1700000000 {
+		t.Errorf("got (%s, %d, %s, %s, %d)", platform, userID, username, login, createdAt)
+	}
+}
+
+// claimAlice registers alice for Telegram 7 and Discord discordA, the
+// two-claimant case.
+func claimAlice(t *testing.T, s *SQLiteStorage) {
+	t.Helper()
+	ctx := context.Background()
+	for _, u := range []deckbox.BotUser{
+		{Platform: deckbox.PlatformTelegram, UserID: 7, Handle: "alice_tg", DeckboxLogin: "alice"},
+		{Platform: deckbox.PlatformDiscord, UserID: discordA, DeckboxLogin: "alice"},
+	} {
+		if err := s.RegisterUser(ctx, u); err != nil {
+			t.Fatalf("register %+v: %v", u, err)
+		}
+	}
+}
+
+func TestRegisterUserOnePerPlatform(t *testing.T) {
+	ctx := context.Background()
+	s := newTestDB(t)
+	claimAlice(t, s)
+
+	if err := s.RegisterUser(ctx, deckbox.BotUser{Platform: deckbox.PlatformDiscord, UserID: discordB, DeckboxLogin: "alice"}); err == nil {
+		t.Error("second Discord claimant of alice must fail")
+	}
+	if err := s.RegisterUser(ctx, deckbox.BotUser{Platform: deckbox.PlatformTelegram, UserID: 7, Handle: "alice_tg", DeckboxLogin: "bob"}); err == nil {
+		t.Error("Telegram 7 claiming a second login must fail")
+	}
+}
+
+func TestContactsFor(t *testing.T) {
+	ctx := context.Background()
+	s := newTestDB(t)
+	claimAlice(t, s)
+
+	got, err := s.ContactsFor(ctx, []string{"alice", "nobody"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := got["nobody"]; ok {
+		t.Error("unclaimed login must have no key")
+	}
+	cs := got["alice"]
+	if len(cs) != 2 || cs[0].Platform != deckbox.PlatformDiscord || cs[0].UserID != discordA || cs[0].Handle != nil ||
+		cs[1].Platform != deckbox.PlatformTelegram || cs[1].UserID != 7 || cs[1].Handle == nil || *cs[1].Handle != "alice_tg" {
+		t.Errorf("want discord then telegram (ordered by platform), got %+v", cs)
+	}
+
+	empty, err := s.ContactsFor(ctx, nil)
+	if err != nil || len(empty) != 0 {
+		t.Errorf("empty logins: want empty map, got %v, %v", empty, err)
+	}
+}
+
+func TestSearchCardRowsNotDuplicatedByClaimants(t *testing.T) {
+	ctx := context.Background()
+	s := newTestDB(t)
+	claimAlice(t, s)
+
+	list := int64(8101)
+	if err := s.SaveDeckboxUser(ctx, deckbox.DeckboxUser{DeckboxLogin: "alice", TradelistID: &list}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SaveCardList(ctx, deckbox.CardList{ListId: list, Cards: map[string]int16{"Lightning Bolt": 4}}); err != nil {
+		t.Fatal(err)
+	}
+
+	results, err := s.SearchCard(ctx, deckbox.Query{Name: "Lightning", Scope: deckbox.ScopeTradelist})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(results) != 1 || results[0].Cards["Lightning Bolt"] != 4 {
+		t.Errorf("want one owner row with quantity 4, got %+v", results)
 	}
 }

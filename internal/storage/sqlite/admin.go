@@ -183,12 +183,13 @@ func (s *SQLiteStorage) PurgeDeckboxUser(ctx context.Context, login string) (dec
 	return result, nil
 }
 
-// UnlinkBotUser removes only the registration claiming a login, leaving the
-// Deckbox User and its Card Lists searchable.
-func (s *SQLiteStorage) UnlinkBotUser(ctx context.Context, login string) error {
+// UnlinkBotUser removes one Bot User's registration, leaving the Deckbox User,
+// its Card Lists and any other claimant of the login in place.
+func (s *SQLiteStorage) UnlinkBotUser(ctx context.Context, platform deckbox.Platform, userID int64) error {
 	const op = "storage.sqlite.UnlinkBotUser"
 
-	res, err := s.db.writeDB.ExecContext(ctx, `DELETE FROM users WHERE deckboxLogin = ?`, login)
+	res, err := s.db.writeDB.ExecContext(ctx,
+		`DELETE FROM users WHERE platform = ? AND userId = ?`, string(platform), userID)
 	if err != nil {
 		return fmt.Errorf("%s: %w", op, err)
 	}
@@ -219,14 +220,14 @@ func (s *SQLiteStorage) AdminOverview(ctx context.Context, staleThreshold int64)
 	}
 
 	orphans, err := collect(ctx, s.db.readDB, `
-	SELECT u.telegramId, u.username, u.deckboxLogin
+	SELECT u.platform, u.userId, u.username, u.deckboxLogin
 	FROM users AS u
 	LEFT JOIN deckbox_users AS d ON d.deckboxLogin = u.deckboxLogin
 	WHERE d.deckboxLogin IS NULL
-	ORDER BY u.deckboxLogin COLLATE NOCASE`, nil,
+	ORDER BY u.deckboxLogin COLLATE NOCASE, u.platform, u.userId`, nil,
 		func(r *sql.Rows) (deckbox.OrphanRegistration, error) {
 			var orphan deckbox.OrphanRegistration
-			err := r.Scan(&orphan.TelegramID, &orphan.TelegramUsername, &orphan.DeckboxLogin)
+			err := r.Scan(&orphan.Contact.Platform, &orphan.Contact.UserID, &orphan.Contact.Handle, &orphan.DeckboxLogin)
 			return orphan, err
 		})
 	if err != nil {
@@ -245,18 +246,17 @@ func (s *SQLiteStorage) AdminUsers(ctx context.Context) ([]deckbox.AdminUser, er
 	// The three correlated counts each resolve through the (listId, cardName)
 	// unique index, so this is an index range count per list rather than a scan.
 	users, err := collect(ctx, s.db.readDB, `
-	SELECT d.deckboxLogin, u.telegramId, u.username,
+	SELECT d.deckboxLogin,
 	       d.updated_at, d.last_error, d.last_card_count,
 	       (SELECT COUNT(*) FROM card_lists c WHERE c.listId = d.inventoryId),
 	       (SELECT COUNT(*) FROM card_lists c WHERE c.listId = d.tradelistId),
 	       (SELECT COUNT(*) FROM card_lists c WHERE c.listId = d.wishlistId)
 	FROM deckbox_users AS d
-	LEFT JOIN users AS u ON u.deckboxLogin = d.deckboxLogin
 	ORDER BY d.deckboxLogin COLLATE NOCASE`, nil,
 		func(r *sql.Rows) (deckbox.AdminUser, error) {
 			var u deckbox.AdminUser
 			var lastError *string
-			if err := r.Scan(&u.DeckboxLogin, &u.TelegramID, &u.TelegramUsername,
+			if err := r.Scan(&u.DeckboxLogin,
 				&u.UpdatedAt, &lastError, &u.LastCardCount,
 				&u.InventoryCount, &u.TradelistCount, &u.WishlistCount); err != nil {
 				return u, err
@@ -276,6 +276,18 @@ func (s *SQLiteStorage) AdminUsers(ctx context.Context) ([]deckbox.AdminUser, er
 		})
 	if err != nil {
 		return nil, fmt.Errorf("%s: %w", op, err)
+	}
+
+	logins := make([]string, len(users))
+	for i, u := range users {
+		logins[i] = u.DeckboxLogin
+	}
+	contacts, err := s.ContactsFor(ctx, logins)
+	if err != nil {
+		return nil, fmt.Errorf("%s: %w", op, err)
+	}
+	for i := range users {
+		users[i].Contacts = contacts[users[i].DeckboxLogin]
 	}
 	return users, nil
 }

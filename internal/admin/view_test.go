@@ -16,6 +16,26 @@ func ptrInt64(n int64) *int64      { return &n }
 func ptrStr(s string) *string      { return &s }
 func ago64(d time.Duration) *int64 { return ptrInt64(time.Now().Add(-d).Unix()) }
 
+func tg(id int64, handle *string) []deckbox.Contact {
+	return []deckbox.Contact{{Platform: deckbox.PlatformTelegram, UserID: id, Handle: handle}}
+}
+
+func TestContactLabel(t *testing.T) {
+	tests := []struct {
+		c    deckbox.Contact
+		want string
+	}{
+		{deckbox.Contact{Platform: deckbox.PlatformTelegram, UserID: 5, Handle: ptrStr("petya")}, "@petya · telegram"},
+		{deckbox.Contact{Platform: deckbox.PlatformTelegram, UserID: 7}, "id 7 · telegram"},
+		{deckbox.Contact{Platform: deckbox.PlatformDiscord, UserID: 9, Handle: ptrStr("alice_mtg")}, "alice_mtg · discord"},
+	}
+	for _, tt := range tests {
+		if got := contactLabel(tt.c); got != tt.want {
+			t.Errorf("contactLabel(%+v) = %q, want %q", tt.c, got, tt.want)
+		}
+	}
+}
+
 func TestBuildManageViewCounts(t *testing.T) {
 	// Three collections, two of them claimed by a Bot User, plus one Orphan
 	// Registration — a login someone typed that never produced a collection.
@@ -26,12 +46,12 @@ func TestBuildManageViewCounts(t *testing.T) {
 		DistinctCards: 12000,
 		TotalQuantity: 240000,
 		Orphans: []deckbox.OrphanRegistration{
-			{TelegramID: 9, DeckboxLogin: "typo_login"},
+			{Contact: deckbox.Contact{Platform: deckbox.PlatformTelegram, UserID: 9}, DeckboxLogin: "typo_login"},
 		},
 	}
 	users := []deckbox.AdminUser{
-		{DeckboxLogin: "petya", TelegramID: ptrInt64(1), TelegramUsername: ptrStr("petya_tg"), MissingLists: 0, UpdatedAt: ago64(time.Hour)},
-		{DeckboxLogin: "masha", TelegramID: ptrInt64(2), MissingLists: 1, UpdatedAt: ago64(30 * time.Hour)},
+		{DeckboxLogin: "petya", Contacts: tg(1, ptrStr("petya_tg")), MissingLists: 0, UpdatedAt: ago64(time.Hour)},
+		{DeckboxLogin: "masha", Contacts: tg(2, nil), MissingLists: 1, UpdatedAt: ago64(30 * time.Hour)},
 		{DeckboxLogin: "vasya", MissingLists: 2, UpdatedAt: nil},
 	}
 
@@ -70,14 +90,14 @@ func TestBuildManageViewCounts(t *testing.T) {
 	if !v.Users[2].Stale || v.Users[2].Age != "never" {
 		t.Errorf("a collection that never refreshed should read as stale/never, got %+v", v.Users[2])
 	}
-	if v.Users[0].Telegram != "@petya_tg" {
-		t.Errorf("Telegram = %q, want the @username", v.Users[0].Telegram)
+	if got := v.Users[0].Contacts; len(got) != 1 || got[0].Label != "@petya_tg · telegram" || got[0].Platform != "telegram" || got[0].UserID != 1 {
+		t.Errorf("Contacts = %+v, want the labelled Telegram contact", got)
 	}
-	if v.Users[1].Telegram != "id 2" {
-		t.Errorf("a registration without a username should fall back to the id, got %q", v.Users[1].Telegram)
+	if got := v.Users[1].Contacts; len(got) != 1 || got[0].Label != "id 2 · telegram" {
+		t.Errorf("a registration without a handle should fall back to the id, got %+v", got)
 	}
-	if v.Users[2].Telegram != "—" {
-		t.Errorf("an unregistered collection should show a dash, got %q", v.Users[2].Telegram)
+	if len(v.Users[2].Contacts) != 0 {
+		t.Errorf("an unregistered collection has no contacts, got %+v", v.Users[2].Contacts)
 	}
 }
 
@@ -94,7 +114,7 @@ func TestCountTileColoursOnlyNonZero(t *testing.T) {
 
 func TestBuildConfirmView(t *testing.T) {
 	users := []deckbox.AdminUser{
-		{DeckboxLogin: "petya", TelegramID: ptrInt64(1), InventoryCount: 1200, TradelistCount: 40, WishlistCount: 3},
+		{DeckboxLogin: "petya", Contacts: tg(1, nil), InventoryCount: 1200, TradelistCount: 40, WishlistCount: 3},
 	}
 
 	t.Run("names what the purge will remove", func(t *testing.T) {

@@ -25,6 +25,7 @@ const (
 	AdminAddr               EnvKey = "ADMIN_ADDR"
 	AdminUser               EnvKey = "ADMIN_USER"
 	AdminPassword           EnvKey = "ADMIN_PASSWORD"
+	DiscordToken            EnvKey = "DISCORD_TOKEN"
 )
 
 func Load() error {

@@ -1,15 +1,17 @@
 package i18n
 
 import (
+	"FriendlyCardFinder/internal/message"
 	"reflect"
 	"regexp"
+	"strings"
 	"testing"
 )
 
 // The translation table's real interface is not T's signature: it is that every
 // key exists in every language, carrying the same format verbs in the same
 // order. Callers rely on both — T falls back to returning the key, and callers
-// Sprintf the result with a fixed number of arguments — so a table that breaks
+// Format the result with a fixed number of spans — so a table that breaks
 // either rule fails in a chat rather than in a build. These tests are where that
 // interface is stated.
 
@@ -58,8 +60,8 @@ func TestEveryLanguageHasEveryKey(t *testing.T) {
 }
 
 func TestFormatVerbsMatchAcrossLanguages(t *testing.T) {
-	// Callers Sprintf these with a fixed argument list, so a translation with
-	// the wrong verbs prints %!d(MISSING) — and only for the users reading in
+	// Callers Format these with a fixed span list, so a translation with the
+	// wrong placeholders prints a literal %s — and only for the users reading in
 	// that language, which is the half nobody testing in English would see.
 	reference := translations[referenceLang]
 
@@ -124,13 +126,58 @@ func TestDetectLang(t *testing.T) {
 func TestTFallsBackRatherThanFailing(t *testing.T) {
 	// Both fallbacks are deliberate: a wrong string beats a crash mid-search.
 	// They are only wrong as the *only* check, which is what the tests above are.
-	if got := T("de", "start.welcome"); got != translations["en"]["start.welcome"] {
+	if got := T("de", "start.title"); got != translations["en"]["start.title"] {
 		t.Error("an unsupported language must fall back to English")
 	}
 	if got := T("en", "no.such.key"); got != "no.such.key" {
 		t.Errorf("an unknown key must return itself, got %q", got)
 	}
-	if got := T("", "start.welcome"); got != translations["en"]["start.welcome"] {
+	if got := T("", "start.title"); got != translations["en"]["start.title"] {
 		t.Error("an empty language must fall back to English")
+	}
+}
+
+func TestFormatFillsPlaceholders(t *testing.T) {
+	got := Format("en", "search.results_header", message.Bold("Shock"))
+	want := message.Message{message.Text("Results for: "), message.Bold("Shock"), message.Text(":\n")}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("got %+v, want %+v", got, want)
+	}
+}
+
+func TestFormatMissingArgKeepsPlaceholder(t *testing.T) {
+	got := Format("en", "deckbox.register_success", message.Text("Petya")).PlainText()
+	if want := "Saved your Deckbox nick, Petya %s"; got != want {
+		t.Errorf("got %q, want %q", got, want)
+	}
+}
+
+func TestNoMarkupInTranslations(t *testing.T) {
+	// Each Platform writes its own markup, so a tag in a translation would reach
+	// Discord as literal text. Keys ending in ".code" are the inside of a code
+	// span: their "<" is the visible placeholder in "/deckbox <your_login>",
+	// which the formatter escapes, not markup.
+	for lang, m := range translations {
+		for key, val := range m {
+			if strings.HasSuffix(key, ".code") {
+				continue
+			}
+			if strings.ContainsAny(val, "<*`") {
+				t.Errorf("%s %q holds markup: %q", lang, key, val)
+			}
+		}
+	}
+}
+
+func TestPlaceholdersAreStringsOnly(t *testing.T) {
+	// Format fills %s and nothing else; any other verb would print literally.
+	for lang, m := range translations {
+		for key, val := range m {
+			for _, v := range formatVerbs(val) {
+				if v != "%s" {
+					t.Errorf("%s %q uses %s; placeholders are %%s only", lang, key, v)
+				}
+			}
+		}
 	}
 }

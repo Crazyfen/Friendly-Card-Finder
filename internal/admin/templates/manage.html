@@ -16,19 +16,20 @@
 <p class="sub">Bot Users whose claimed login has no collection — usually a typo at <code>/deckbox</code>. Search can never return them.</p>
 <div class="scroll">
 <table>
-  <thead><tr><th>Login claimed</th><th>Telegram</th><th></th></tr></thead>
+  <thead><tr><th>Login claimed</th><th>Bot Users</th><th></th></tr></thead>
   <tbody>
   {{range .Orphans}}
     <tr>
-      <td>{{.DeckboxLogin}}</td>
-      <td class="muted">{{if .TelegramUsername}}@{{.TelegramUsername}}{{else}}id {{.TelegramID}}{{end}}</td>
+      <td>{{.Login}}</td>
+      <td class="muted">{{.Label}}</td>
       <td>
         <form class="inline" method="post" action="/add">
-          <input type="hidden" name="login" value="{{.DeckboxLogin}}">
+          <input type="hidden" name="login" value="{{.Login}}">
           <button type="submit">Try scraping it</button>
         </form>
         <form class="inline" method="post" action="/unlink">
-          <input type="hidden" name="login" value="{{.DeckboxLogin}}">
+          <input type="hidden" name="platform" value="{{.Platform}}">
+          <input type="hidden" name="userId" value="{{.UserID}}">
           <button type="submit" class="danger">Unlink</button>
         </form>
       </td>
@@ -47,7 +48,7 @@
 </form>
 
 <h2>Deckbox Users</h2>
-<p class="sub">Card counts are rows per list. Purge removes the collection, its cards and any registration; Unlink keeps the collection.</p>
+<p class="sub">Card counts are rows per list. Purge removes the collection, its cards and every registration; Unlink removes one Bot User and keeps the collection.</p>
 {{if not .Users}}
 <p class="muted">No collections tracked yet.</p>
 {{else}}
@@ -55,7 +56,7 @@
 <table>
   <thead>
     <tr>
-      <th>Login</th><th>Telegram</th>
+      <th>Login</th><th>Bot Users</th>
       <th class="num">Inventory</th><th class="num">Tradelist</th><th class="num">Wishlist</th>
       <th>Refreshed</th><th>Last error</th><th>Actions</th>
     </tr>
@@ -64,7 +65,7 @@
   {{range .Users}}
     <tr>
       <td>{{.Login}}{{if .Missing}} <span class="warn-text" title="{{.Missing}} of 3 lists absent or empty">·{{.Missing}}</span>{{end}}</td>
-      <td class="muted">{{.Telegram}}</td>
+      <td class="muted">{{range .Contacts}}{{.Label}}<br>{{else}}—{{end}}</td>
       <td class="num">{{.Inventory}}</td>
       <td class="num">{{.Tradelist}}</td>
       <td class="num">{{.Wishlist}}</td>
@@ -75,10 +76,13 @@
           <input type="hidden" name="login" value="{{.Login}}">
           <button type="submit">Refresh</button>
         </form>
+        {{range .Contacts}}
         <form class="inline" method="post" action="/unlink">
-          <input type="hidden" name="login" value="{{.Login}}">
-          <button type="submit">Unlink</button>
+          <input type="hidden" name="platform" value="{{.Platform}}">
+          <input type="hidden" name="userId" value="{{.UserID}}">
+          <button type="submit" title="Unlink {{.Label}}">Unlink {{.Platform}}</button>
         </form>
+        {{end}}
         <a class="btn danger" href="/purge?login={{.Login}}">Purge…</a>
       </td>
     </tr>

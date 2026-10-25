@@ -46,9 +46,10 @@ func New(log *slog.Logger, storage DeckboxSaver, admin AdminStore, scraper Fetch
 
 // Registration is the input for /deckbox, carrying only what the domain needs.
 type Registration struct {
-	TelegramID       int64
-	TelegramUsername string
-	DeckboxLogin     string
+	Platform     Platform
+	UserID       int64
+	Handle       string
+	DeckboxLogin string
 }
 
 // Register stores the Bot User and refreshes their lists in the background, so
@@ -57,12 +58,13 @@ func (d *Deckbox) Register(ctx context.Context, r Registration) error {
 	const op = "deckbox.Register"
 	log := d.log.With(slog.String("operation", op), slog.String("deckbox_id", r.DeckboxLogin))
 
-	log.Info("registering user", slog.String("username", r.TelegramUsername))
+	log.Info("registering user", slog.String("platform", string(r.Platform)), slog.String("username", r.Handle))
 
 	if err := d.storage.RegisterUser(ctx, BotUser{
-		TelegramID:       r.TelegramID,
-		TelegramUsername: r.TelegramUsername,
-		DeckboxLogin:     r.DeckboxLogin,
+		Platform:     r.Platform,
+		UserID:       r.UserID,
+		Handle:       r.Handle,
+		DeckboxLogin: r.DeckboxLogin,
 	}); err != nil {
 		log.Error("failed to register user", sl.Err(err))
 		return err
@@ -404,11 +406,9 @@ func (d *Deckbox) Search(ctx context.Context, cardNames []string, scope Scope) (
 			agg, ok := aggregates[cl.ListId]
 			if !ok {
 				agg = &UserSearchAggregate{
-					ListId:           cl.ListId,
-					DeckboxLogin:     cl.DeckboxLogin,
-					TelegramID:       cl.TelegramID,
-					TelegramUsername: cl.TelegramUsername,
-					FoundCards:       make(map[string]int16),
+					ListId:       cl.ListId,
+					DeckboxLogin: cl.DeckboxLogin,
+					FoundCards:   make(map[string]int16),
 				}
 				aggregates[cl.ListId] = agg
 			}
@@ -440,5 +440,32 @@ func (d *Deckbox) Search(ctx context.Context, cardNames []string, scope Scope) (
 		return a.DeckboxLogin < b.DeckboxLogin
 	})
 
+	d.attachContacts(ctx, log, result.Aggregates)
+
 	return result, nil
+}
+
+// attachContacts fills each Aggregate's Contacts with one read for all matched
+// logins. Contacts are decoration, so a failure is logged and the result is
+// returned without them.
+func (d *Deckbox) attachContacts(ctx context.Context, log *slog.Logger, aggs []UserSearchAggregate) {
+	if len(aggs) == 0 {
+		return
+	}
+	logins := make([]string, 0, len(aggs))
+	seen := make(map[string]bool, len(aggs))
+	for _, a := range aggs {
+		if !seen[a.DeckboxLogin] {
+			seen[a.DeckboxLogin] = true
+			logins = append(logins, a.DeckboxLogin)
+		}
+	}
+	contacts, err := d.storage.ContactsFor(ctx, logins)
+	if err != nil {
+		log.Warn("failed to load contacts", sl.Err(err))
+		return
+	}
+	for i := range aggs {
+		aggs[i].Contacts = contacts[aggs[i].DeckboxLogin]
+	}
 }

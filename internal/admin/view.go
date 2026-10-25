@@ -29,7 +29,7 @@ type tile struct {
 
 type userRow struct {
 	Login     string
-	Telegram  string
+	Contacts  []contactView
 	Inventory string
 	Tradelist string
 	Wishlist  string
@@ -44,7 +44,7 @@ type manageView struct {
 	Message string
 	Tiles   []tile
 	Users   []userRow
-	Orphans []deckbox.OrphanRegistration
+	Orphans []orphanRow
 }
 
 type demandRow struct {
@@ -107,7 +107,7 @@ type confirmView struct {
 	Inventory       string
 	Tradelist       string
 	Wishlist        string
-	Telegram        string
+	Contacts        string
 	HasRegistration bool
 }
 
@@ -125,8 +125,8 @@ func buildConfirmView(users []deckbox.AdminUser, login string) (confirmView, boo
 			Inventory:       humanCount(int64(u.InventoryCount)),
 			Tradelist:       humanCount(int64(u.TradelistCount)),
 			Wishlist:        humanCount(int64(u.WishlistCount)),
-			Telegram:        telegramLabel(u),
-			HasRegistration: u.TelegramID != nil,
+			Contacts:        strings.Join(contactLabels(u.Contacts), ", "),
+			HasRegistration: len(u.Contacts) > 0,
 		}, true
 	}
 	return confirmView{}, false
@@ -160,7 +160,7 @@ func buildManageView(o deckbox.Overview, users []deckbox.AdminUser, msg string) 
 	for _, u := range users {
 		v.Users = append(v.Users, userRow{
 			Login:     u.DeckboxLogin,
-			Telegram:  telegramLabel(u),
+			Contacts:  contactViews(u.Contacts),
 			Inventory: humanCount(int64(u.InventoryCount)),
 			Tradelist: humanCount(int64(u.TradelistCount)),
 			Wishlist:  humanCount(int64(u.WishlistCount)),
@@ -171,7 +171,9 @@ func buildManageView(o deckbox.Overview, users []deckbox.AdminUser, msg string) 
 		})
 	}
 
-	v.Orphans = o.Orphans
+	for _, orph := range o.Orphans {
+		v.Orphans = append(v.Orphans, orphanRow{Login: orph.DeckboxLogin, contactView: toContactView(orph.Contact)})
+	}
 	return v
 }
 
@@ -185,15 +187,49 @@ func countTile(label, note string, n int, status string) tile {
 	return t
 }
 
-func telegramLabel(u deckbox.AdminUser) string {
-	switch {
-	case u.TelegramUsername != nil && *u.TelegramUsername != "":
-		return "@" + *u.TelegramUsername
-	case u.TelegramID != nil:
-		return "id " + strconv.FormatInt(*u.TelegramID, 10)
-	default:
-		return "—"
+// contactLabel names a Bot User for the operator: the handle when there is one
+// (Telegram's with its @), the numeric id otherwise, then the Platform.
+func contactLabel(c deckbox.Contact) string {
+	who := "id " + strconv.FormatInt(c.UserID, 10)
+	if c.Handle != nil && *c.Handle != "" {
+		who = *c.Handle
+		if c.Platform == deckbox.PlatformTelegram {
+			who = "@" + who
+		}
 	}
+	return who + " · " + string(c.Platform)
+}
+
+func contactLabels(cs []deckbox.Contact) []string {
+	out := make([]string, len(cs))
+	for i, c := range cs {
+		out[i] = contactLabel(c)
+	}
+	return out
+}
+
+// contactView carries what an Unlink form needs alongside the label.
+type contactView struct {
+	Label    string
+	Platform string
+	UserID   int64
+}
+
+func toContactView(c deckbox.Contact) contactView {
+	return contactView{Label: contactLabel(c), Platform: string(c.Platform), UserID: c.UserID}
+}
+
+func contactViews(cs []deckbox.Contact) []contactView {
+	out := make([]contactView, len(cs))
+	for i, c := range cs {
+		out[i] = toContactView(c)
+	}
+	return out
+}
+
+type orphanRow struct {
+	Login string
+	contactView
 }
 
 func buildInsightsView(in deckbox.Insights, computedAt time.Time) insightsView {

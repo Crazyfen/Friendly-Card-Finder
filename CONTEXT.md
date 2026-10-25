@@ -2,7 +2,11 @@
 
 The names this project uses for its own concepts. Architecture and conventions live in [`CLAUDE.md`](CLAUDE.md); this file is only the glossary.
 
-**Bot User** — someone who registered with the bot via `/deckbox <login>`. Carries a Telegram ID and username, and the Deckbox login they claimed. Not every list owner is a Bot User; unregistered owners show up in results without a Telegram mention.
+**Bot User** — one chat account that registered with the bot via `/deckbox <login>`, on one **Platform**. Carries the Platform, that account's ID and handle, and the Deckbox login it claimed. A Deckbox login has at most one Bot User per Platform; a Telegram claimant and a Discord claimant of the same login are independent registrations, not linked, and neither verifies the other. Not every list owner is a Bot User; unregistered owners show up in results without a contact.
+
+**Contact** — how a reader can reach a list owner: one per Bot User claiming the owner's Deckbox login. A search result shows every Contact the owner has, the reader's own Platform first; a Contact from the other Platform is shown in the form that still works from the reader's side, or left out if no such form exists.
+
+**Platform** — a chat service the bot answers on: Telegram or Discord. Every Command behaves the same on both; only the delivery and markup differ.
 
 **Deckbox User** — a profile on deckbox.org, identified by its login. Owns up to three Card Lists and carries the `updated_at` timestamp that drives refresh.
 
@@ -14,11 +18,11 @@ The names this project uses for its own concepts. Architecture and conventions l
 
 **Scope** — which of the three Card Lists a search runs against: `tradelist` (plain text search), `wishlist` (`/sell`), or `inventory`. A named type, not a bare string, because both the storage column and the Telegram wording default to the tradelist when they do not recognise the value.
 
-**Command** — one thing a Bot User can ask for, as a method on `telegram.Commands` taking a Request and returning Replies. The Command owns the wording, the missing-argument case and the Scope; `main.go` owns only the Telegram SDK calls that carry them.
+**Command** — one thing a Bot User can ask for, as a method on `chat.Commands` taking a Request and returning Replies. The same Command serves every Platform. The Command owns the wording, the missing-argument case and the Scope; each Platform's adapter owns only the SDK calls that carry them.
 
-**Request** — one incoming message reduced to what a Command needs: the text with any command prefix stripped, the detected language, and who sent it from where.
+**Request** — one incoming message reduced to what a Command needs: the text with any command prefix stripped, the detected language, the Platform, and who sent it from where. A Discord message with no locale (a DM or mention, as opposed to a slash command) is English.
 
-**Reply** — one message to send back, and whether it is HTML and whether it quotes the message that triggered it. A Command returns these rather than sending, which is what makes every Command reachable from a test.
+**Reply** — one message to send back, as platform-neutral structure (text, emphasis, links, Contacts) that each Platform formats in its own markup, and whether it quotes the message that triggered it. A Command returns these rather than sending, which is what makes every Command reachable from a test.
 
 **Query** — one parsed search line: the card name with quotes stripped, whether the user asked for an exact match, and the Scope. Built by `ParseQuery`.
 
@@ -34,9 +38,9 @@ The names this project uses for its own concepts. Architecture and conventions l
 
 **Admin Panel** — the web surface at `/` (manage) and `/insights` (analytics), served by the bot process behind Caddy. Its audience is the operator, not Bot Users, so its wording is hardcoded English rather than going through `i18n`.
 
-**Purge** — removing a Deckbox User completely: their three Card Lists, every card row, the FTS rows, the `deckbox_users` row, and the Bot User registration claiming that login. The login is then unknown to the bot until someone registers it again.
+**Purge** — removing a Deckbox User completely: their three Card Lists, every card row, the FTS rows, the `deckbox_users` row, and every Bot User claiming that login, on every Platform. The login is then unknown to the bot until someone registers it again.
 
-**Unlink** — removing only the Bot User registration, leaving the Deckbox User and its Card Lists in place. For when someone's Telegram account changes but their Deckbox login does not.
+**Unlink** — removing one Bot User — one Platform's claim on a login — leaving the Deckbox User, its Card Lists and any claim from the other Platform in place. For when someone's chat account changes but their Deckbox login does not, or a stranger claimed the login on one Platform.
 
 **Orphan Registration** — a Bot User whose `deckboxLogin` has no Deckbox User: a login claimed via `/deckbox` that never produced a collection, usually a typo. Invisible to search, so the Admin Panel surfaces them.
 

@@ -16,6 +16,8 @@ type fakeStorage struct {
 	getDeckboxUserFn func(ctx context.Context, login string) (*DeckboxUser, error)
 	searchResults    []CardListWithOwner
 	searchFn         func(cardName string) []CardListWithOwner
+	contacts         map[string][]Contact
+	contactsErr      error
 
 	// timestampUpdated, when non-nil, is closed the first time the timestamp is
 	// written — so the background refresh Register kicks off can be awaited.
@@ -38,6 +40,9 @@ type fakeStorage struct {
 }
 
 func (f *fakeStorage) RegisterUser(ctx context.Context, user BotUser) error        { return nil }
+func (f *fakeStorage) ContactsFor(ctx context.Context, logins []string) (map[string][]Contact, error) {
+	return f.contacts, f.contactsErr
+}
 func (f *fakeStorage) SaveDeckboxUser(ctx context.Context, user DeckboxUser) error { return nil }
 func (f *fakeStorage) SaveCardList(ctx context.Context, list CardList) error {
 	f.mu.Lock()
@@ -105,7 +110,8 @@ type fakeAdmin struct {
 
 	mu            sync.Mutex
 	purgedLogin   string
-	unlinkedLogin string
+	unlinkedPlatform Platform
+	unlinkedID       int64
 }
 
 func (f *fakeAdmin) PurgeDeckboxUser(ctx context.Context, login string) (PurgeResult, error) {
@@ -115,10 +121,10 @@ func (f *fakeAdmin) PurgeDeckboxUser(ctx context.Context, login string) (PurgeRe
 	return f.purgeResult, f.purgeErr
 }
 
-func (f *fakeAdmin) UnlinkBotUser(ctx context.Context, login string) error {
+func (f *fakeAdmin) UnlinkBotUser(ctx context.Context, platform Platform, userID int64) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.unlinkedLogin = login
+	f.unlinkedPlatform, f.unlinkedID = platform, userID
 	return nil
 }
 
@@ -204,9 +210,10 @@ func TestRegisterRefreshesAndStampsTimestamp(t *testing.T) {
 	d := newTestDeckbox(storage, &fakeScraper{})
 
 	if err := d.Register(context.Background(), Registration{
-		TelegramID:       1,
-		TelegramUsername: "alice",
-		DeckboxLogin:     "alice_db",
+		Platform:     PlatformTelegram,
+		UserID:       1,
+		Handle:       "alice",
+		DeckboxLogin: "alice_db",
 	}); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -418,6 +425,46 @@ func TestSearchSingleCardKeepsOneAggregatePerList(t *testing.T) {
 	}
 	if result.Aggregates[1].ListId != 20 || result.Aggregates[1].FoundCards["Bolt"] != 4 {
 		t.Errorf("second aggregate: want list 20 with Bolt=4, got %+v", result.Aggregates[1])
+	}
+}
+
+func TestSearchAttachesContacts(t *testing.T) {
+	handle := "alice_tg"
+	want := []Contact{
+		{Platform: PlatformDiscord, UserID: 900000000000000001},
+		{Platform: PlatformTelegram, UserID: 7, Handle: &handle},
+	}
+	storage := &fakeStorage{
+		searchResults: []CardListWithOwner{listMatch(10, "alice", map[string]int16{"Bolt": 2})},
+		contacts:      map[string][]Contact{"alice": want},
+	}
+	d := newTestDeckbox(storage, &fakeScraper{})
+
+	result, err := d.Search(context.Background(), []string{"Bolt"}, ScopeTradelist)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(result.Aggregates) != 1 || len(result.Aggregates[0].Contacts) != 2 {
+		t.Fatalf("want one aggregate with both contacts, got %+v", result.Aggregates)
+	}
+	if result.Aggregates[0].Contacts[1].UserID != 7 {
+		t.Errorf("contacts out of order: %+v", result.Aggregates[0].Contacts)
+	}
+}
+
+func TestSearchWithoutContactsStillAnswers(t *testing.T) {
+	storage := &fakeStorage{
+		searchResults: []CardListWithOwner{listMatch(10, "alice", map[string]int16{"Bolt": 2})},
+		contactsErr:   errors.New("db busy"),
+	}
+	d := newTestDeckbox(storage, &fakeScraper{})
+
+	result, err := d.Search(context.Background(), []string{"Bolt"}, ScopeTradelist)
+	if err != nil {
+		t.Fatalf("contacts failure must not fail the search: %v", err)
+	}
+	if len(result.Aggregates) != 1 || result.Aggregates[0].Contacts != nil {
+		t.Errorf("want the aggregate without contacts, got %+v", result.Aggregates)
 	}
 }
 

@@ -41,9 +41,10 @@ func seedUser(t *testing.T, s *SQLiteStorage, login string, base int64, register
 	if registered {
 		name := login + "_tg"
 		if err := s.RegisterUser(ctx, deckbox.BotUser{
-			TelegramID:       base,
-			TelegramUsername: name,
-			DeckboxLogin:     login,
+			Platform:     deckbox.PlatformTelegram,
+			UserID:       base,
+			Handle:       name,
+			DeckboxLogin: login,
 		}); err != nil {
 			t.Fatalf("register %s: %v", login, err)
 		}
@@ -172,7 +173,7 @@ func TestUnlinkKeepsCollection(t *testing.T) {
 	s := newTestDB(t)
 	seedUser(t, s, "petya", 100, true)
 
-	if err := s.UnlinkBotUser(ctx, "petya"); err != nil {
+	if err := s.UnlinkBotUser(ctx, deckbox.PlatformTelegram, 100); err != nil {
 		t.Fatalf("unlink failed: %v", err)
 	}
 
@@ -184,11 +185,11 @@ func TestUnlinkKeepsCollection(t *testing.T) {
 	}
 
 	users, _ := s.AdminUsers(ctx)
-	if len(users) != 1 || users[0].TelegramID != nil {
+	if len(users) != 1 || len(users[0].Contacts) != 0 {
 		t.Errorf("expected the collection with no registration, got %+v", users)
 	}
 
-	if err := s.UnlinkBotUser(ctx, "petya"); !errors.Is(err, deckbox.ErrUnknownLogin) {
+	if err := s.UnlinkBotUser(ctx, deckbox.PlatformTelegram, 100); !errors.Is(err, deckbox.ErrUnknownLogin) {
 		t.Errorf("expected ErrUnknownLogin unlinking twice, got %v", err)
 	}
 }
@@ -300,7 +301,7 @@ func TestAdminOverviewCountsOrphansAndMissingLists(t *testing.T) {
 
 	// A registration whose login has no collection at all.
 	if err := s.RegisterUser(ctx, deckbox.BotUser{
-		TelegramID: 999, TelegramUsername: "typo", DeckboxLogin: "ptya",
+		Platform: deckbox.PlatformTelegram, UserID: 999, Handle: "typo", DeckboxLogin: "ptya",
 	}); err != nil {
 		t.Fatalf("register orphan: %v", err)
 	}
@@ -486,5 +487,94 @@ func TestNewDeletesUnreferencedLists(t *testing.T) {
 	}
 	if c, _, _ := listRows(t, s, 101); c != 2 {
 		t.Errorf("referenced list 101 lost its rows: %d left", c)
+	}
+}
+
+// registerDiscord adds a Discord claimant to an already seeded login.
+func registerDiscord(t *testing.T, s *SQLiteStorage, login string, id int64, handle string) {
+	t.Helper()
+	if err := s.RegisterUser(context.Background(), deckbox.BotUser{
+		Platform: deckbox.PlatformDiscord, UserID: id, Handle: handle, DeckboxLogin: login,
+	}); err != nil {
+		t.Fatalf("register discord %d: %v", id, err)
+	}
+}
+
+func TestUnlinkRemovesOneBotUser(t *testing.T) {
+	ctx := context.Background()
+	s := newTestDB(t)
+	seedUser(t, s, "alice", 7, true) // Telegram 7
+	registerDiscord(t, s, "alice", 9, "alice_mtg")
+
+	if err := s.UnlinkBotUser(ctx, deckbox.PlatformDiscord, 9); err != nil {
+		t.Fatalf("unlink failed: %v", err)
+	}
+
+	users, err := s.AdminUsers(ctx)
+	if err != nil || len(users) != 1 {
+		t.Fatalf("users = %+v, err %v", users, err)
+	}
+	if c := users[0].Contacts; len(c) != 1 || c[0].Platform != deckbox.PlatformTelegram || c[0].UserID != 7 {
+		t.Errorf("expected only the Telegram contact left, got %+v", c)
+	}
+}
+
+func TestPurgeRemovesEveryClaimant(t *testing.T) {
+	ctx := context.Background()
+	s := newTestDB(t)
+	seedUser(t, s, "alice", 7, true)
+	registerDiscord(t, s, "alice", 9, "alice_mtg")
+
+	res, err := s.PurgeDeckboxUser(ctx, "alice")
+	if err != nil {
+		t.Fatalf("purge failed: %v", err)
+	}
+	if !res.Registration {
+		t.Error("expected Registration to be reported")
+	}
+	contacts, _ := s.ContactsFor(ctx, []string{"alice"})
+	if len(contacts["alice"]) != 0 {
+		t.Errorf("claimants survived the purge: %+v", contacts)
+	}
+}
+
+func TestAdminUsersOneRowPerLogin(t *testing.T) {
+	ctx := context.Background()
+	s := newTestDB(t)
+	seedUser(t, s, "alice", 7, true)
+	registerDiscord(t, s, "alice", 9, "alice_mtg")
+	seedUser(t, s, "bob", 20, false)
+
+	users, err := s.AdminUsers(ctx)
+	if err != nil {
+		t.Fatalf("admin users failed: %v", err)
+	}
+	if len(users) != 2 {
+		t.Fatalf("expected one row per login, got %+v", users)
+	}
+	if got := users[0].Contacts; len(got) != 2 || got[0].Platform != deckbox.PlatformDiscord || got[1].Platform != deckbox.PlatformTelegram {
+		t.Errorf("alice contacts = %+v, want discord and telegram", got)
+	}
+	if len(users[1].Contacts) != 0 {
+		t.Errorf("bob has no claimant, got %+v", users[1].Contacts)
+	}
+}
+
+func TestOrphansCarryPlatform(t *testing.T) {
+	ctx := context.Background()
+	s := newTestDB(t)
+	registerDiscord(t, s, "ghost", 9, "typo")
+
+	o, err := s.AdminOverview(ctx, time.Now().Unix())
+	if err != nil {
+		t.Fatalf("overview failed: %v", err)
+	}
+	if len(o.Orphans) != 1 {
+		t.Fatalf("expected the Discord orphan, got %+v", o.Orphans)
+	}
+	got := o.Orphans[0]
+	if got.Contact.Platform != deckbox.PlatformDiscord || got.Contact.UserID != 9 ||
+		got.Contact.Handle == nil || *got.Contact.Handle != "typo" || got.DeckboxLogin != "ghost" {
+		t.Errorf("orphan = %+v", got)
 	}
 }

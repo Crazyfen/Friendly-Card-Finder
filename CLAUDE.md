@@ -25,9 +25,11 @@ FTS5 tests skip automatically when the driver lacks FTS5 support. Scraper integr
 ## Architecture
 
 ```
-main.go                      Bot setup, handler registration, Telegram SDK adapter
+main.go                      Config, storage, scraper, refresh ticker, panel; starts the adapters
 internal/
   admin/                     Admin Panel: net/http + embedded html/template (manage + insights)
+  chat/command.go            Request/Reply + Commands: every command's behaviour, any Platform
+  chat/render.go             Search results → message.Message spans
   config/config.go           Load() validates and returns; MustLoad fatals on the error
   deckbox/
     deckbox.go               Domain types + Scope/Query/SearchResult + DeckboxSaver/AdminStore
@@ -35,15 +37,18 @@ internal/
     session.go               Cookie resolution, single-flight login, persistence
     handler.go               Deckbox receiver: Register, Search, RefreshStale, Suggest
   storage/sqlite/sqlite.go   SQLite implementation of DeckboxSaver + AdminStore
-  storage/sqlite/admin.go    Purge/Unlink, Demand counters, panel queries
-  telegram/command.go        Request/Reply + Commands: every command's behaviour
-  telegram/render.go         Search results → Telegram HTML
-  i18n/i18n.go               RU/EN translations via T(lang, key)
+  storage/sqlite/admin.go    Purge (every claimant)/Unlink (one Bot User), Demand counters, panel queries
+  message/message.go         Message = []Span (text, bold, code, link, Contacts)
+  telegram/telegram.go       Telegram adapter: SDK update → chat.Request, chat.Reply → SendMessage
+  telegram/format.go         message.Message → Telegram HTML (escapes every text)
+  discord/discord.go         Discord adapter: slash command/modal/DM/mention → chat.Request, chat.Reply → messages
+  discord/format.go          message.Message → Discord Markdown (escapes every text)
+  i18n/i18n.go               RU/EN markup-free translations; Format(lang, key, spans...) fills %s
   lib/logger/sl/sl.go        sl.Err(err) helper for slog
 env/env.go                   EnvKey type + godotenv Load()
 ```
 
-`internal/deckbox` deals only in domain values — it imports neither `i18n` nor the Telegram SDK. All wording and markup live in `internal/telegram`, and the Telegram SDK itself appears only in `main.go`, which maps `models.Update` → `telegram.Request` and `telegram.Reply` → `SendMessage`. Every command is therefore reachable from a test as a plain function.
+`internal/deckbox` deals only in domain values — it imports neither `i18n` nor the Telegram SDK. All wording lives in `internal/chat` and `internal/i18n`, which produce platform-neutral `message.Message` spans; markup is written only by each adapter's formatter (`telegram.Format` → HTML, `discord.Format` → Markdown). The chat SDKs appear only in the adapters: `internal/telegram` maps `models.Update` → `chat.Request` and `chat.Reply` → `SendMessage`; `internal/discord` (discordgo) does the same for interactions and messages. Every command is therefore reachable from a test as a plain function. See `docs/adr/0010`.
 
 Storage is split across two interfaces, both satisfied by the same `*sqlite.SQLiteStorage`: `DeckboxSaver` for search and Refresh, `AdminStore` for the Admin Panel. A new panel query widens only `AdminStore`, so it never reaches the fakes in the search and Refresh tests.
 
@@ -51,15 +56,16 @@ Storage is split across two interfaces, both satisfied by the same `*sqlite.SQLi
 
 ### Data flow
 
-1. **Card search** (default text handler): `App.handle` → `telegram.NewRequest` → `Commands.Search` → `App.send`. A background ticker runs `RefreshStale` (users older than `CARD_LIST_REFRESH_HOURS`, default 3h) so searches never block on a refresh → `Deckbox.Search` → `telegram.RenderSearch` → split/send (4096-byte Telegram limit; `tgutil.SplitMessage` cuts on newlines, respects UTF-8 runes). A query wrapped in quotes (`"Shock"`; also `''`/`«»`/`“”`/`‘’` and low-9 `„“`/`„”` — see `exactQuotePairs`) is an exact-name match: `ParseQuery` strips the quotes and sets `Query.Exact`. One search handles 1..n names: `Search` parses each line once up front, so `SearchQueries`/`NotFound` echo the stripped names, and runs the per-card queries concurrently (8 max) over the read pool, merging deterministically. `RenderSearch` picks the single-card layout (per-owner card lines, Deckbox link pre-filtered to the query) when one name was searched and the ranked multi-card layout otherwise
+1. **Card search** (default text handler): `telegram.Adapter.handle` → `telegram.NewRequest` → `chat.Commands.Search` → `Adapter.send` (`telegram.Format`, always ParseMode HTML). A background ticker runs `RefreshStale` (users older than `CARD_LIST_REFRESH_HOURS`, default 3h) so searches never block on a refresh → `Deckbox.Search` → `chat.RenderSearch` → split/send (4096-byte Telegram limit; `tgutil.SplitMessage` cuts on newlines, respects UTF-8 runes). A query wrapped in quotes (`"Shock"`; also `''`/`«»`/`“”`/`‘’` and low-9 `„“`/`„”` — see `exactQuotePairs`) is an exact-name match: `ParseQuery` strips the quotes and sets `Query.Exact`. One search handles 1..n names: `Search` parses each line once up front, so `SearchQueries`/`NotFound` echo the stripped names, and runs the per-card queries concurrently (8 max) over the read pool, merging deterministically. `RenderSearch` picks the single-card layout (per-owner card lines, Deckbox link pre-filtered to the query) when one name was searched and the ranked multi-card layout otherwise
 2. **Registration** (`/deckbox <login>`): `Register` → `RegisterUser` → background refresh through the **same** worker pool every other caller uses (1 worker, 2-minute timeout), so registration also stamps `updated_at`
-3. **Batch refresh** (`/suggestdeckbox <logins>`): 5-worker pool with a freshness pre-filter. The one command that answers twice — `Commands.Suggest` returns the acknowledgement plus a function producing the summary, and `App.suggestHandler` decides where that runs (a goroutine in production, inline in tests)
+3. **Batch refresh** (`/suggestdeckbox <logins>`): 5-worker pool with a freshness pre-filter. The one command that answers twice — `Commands.Suggest` returns the acknowledgement plus a function producing the summary, and `telegram.Adapter.suggestHandler` decides where that runs (a goroutine in production, inline in tests)
 4. **Wishlist search** (`/sell`): identical to card search with `ScopeWishlist`
-5. **Admin Panel** (`/` and `/insights` over HTTP): `internal/admin` → `Deckbox` (`Purge`, `Unlink`, `RefreshNow`, `AdminOverview`/`AdminUsers`/`AdminInsights`) → `AdminStore`. It never touches storage directly, so panel actions and bot commands share one set of domain operations
+5. **Discord**: slash command / modal / DM / mention → `discord` adapter → same `chat.Commands`; search and `/deckbox` (anything that reaches storage) defer and follow up, `/deckbox` ephemerally; Suggest's summary is a channel message (ADR 0012). Optional: empty `DISCORD_TOKEN` disables it. 2000-byte limit; every message carries an empty `AllowedMentions` except the Suggest summary, which pings only the requester
+6. **Admin Panel** (`/` and `/insights` over HTTP): `internal/admin` → `Deckbox` (`Purge`, `Unlink(platform, userId)`, `RefreshNow`, `AdminOverview`/`AdminUsers`/`AdminInsights`) → `AdminStore`. It never touches storage directly, so panel actions and bot commands share one set of domain operations
 
 ### Admin Panel
 
-Runs in the bot process, listens on `ADMIN_ADDR` (default `:8081`), and publishes **no** port: a Caddy sidecar terminates TLS for `admin.ivash.net` and proxies to it over the compose network, so there is no route that bypasses TLS and auth. HTTP Basic Auth (`ADMIN_USER`/`ADMIN_PASSWORD`, `subtle.ConstantTimeCompare`, one-second sleep on failure); the panel refuses to start when `ADMIN_PASSWORD` is empty. Mutating routes are POST-only and rejected unless `Sec-Fetch-Site` is `same-origin` (Basic Auth makes CSRF worse, not better — the browser re-sends credentials automatically). Purge is confirmed by a `GET /purge?login=` page rather than a JS dialog, which keeps the CSP at `default-src 'none'`. Analytics are memoized for 5 minutes because their card queries aggregate every wishlist and tradelist. Keep the `CROSS JOIN`s in `AdminInsights` (join order, see the comment there). See `docs/adr/0003`.
+Runs in the bot process, listens on `ADMIN_ADDR` (default `:8081`), and publishes **no** port: a Caddy sidecar terminates TLS for `admin.ivash.net` and proxies to it over the compose network, so there is no route that bypasses TLS and auth. HTTP Basic Auth (`ADMIN_USER`/`ADMIN_PASSWORD`, `subtle.ConstantTimeCompare`, one-second sleep on failure); the panel refuses to start when `ADMIN_PASSWORD` is empty. Mutating routes are POST-only and rejected unless `Sec-Fetch-Site` is `same-origin` (Basic Auth makes CSRF worse, not better — the browser re-sends credentials automatically). Purge is confirmed by a `GET /purge?login=` page rather than a JS dialog, which keeps the CSP at `default-src 'none'`. Purge removes the collection and every Bot User claiming the login; Unlink (`POST /unlink`, form fields `platform` + `userId`) removes exactly one Bot User and keeps the collection, and the manage page renders one Unlink button per Contact. Analytics are memoized for 5 minutes because their card queries aggregate every wishlist and tradelist. Keep the `CROSS JOIN`s in `AdminInsights` (join order, see the comment there). See `docs/adr/0003`.
 
 ### Demand
 
@@ -106,13 +112,13 @@ All profile/export fetches go through one shared `http.Transport` (keep-alive, 1
 
 **Errors**: storage ops return `error` directly; `fmt.Errorf("%s: %w", op, err)` in init code only.
 
-**Testing async handlers**: build a `Deckbox` with `New` over a fake `DeckboxSaver` + fake `AdminStore` + fake `Fetcher` (see `handler_test.go`), then call the method directly. Commands are tested against a fake `telegram.Domain` with no bot, database or scraper (`command_test.go`). Background work (registration's refresh) is observed with a channel the fake closes.
+**Testing async handlers**: build a `Deckbox` with `New` over a fake `DeckboxSaver` + fake `AdminStore` + fake `Fetcher` (see `handler_test.go`), then call the method directly. Commands are tested against a fake `chat.Domain` with no bot, database or scraper (`internal/chat/command_test.go`), asserting on `Message.PlainText()`; Telegram's exact bytes are pinned by the goldens in `internal/telegram/format_test.go`. Background work (registration's refresh) is observed with a channel the fake closes.
 
 **Adding a command**:
 
-1. Method on `telegram.Commands` with the signature `func(context.Context, Request) []Reply` — argument in `req.Text` (already stripped of the command prefix), wording via `i18n.T(req.Lang, ...)`. Test it in `command_test.go`
-2. Add whatever it needs to `telegram.Domain`
-3. Register in `main.go`: `b.RegisterHandler(bot.HandlerTypeMessageText, "cmd", bot.MatchTypeCommandStartOnly, app.handle("cmd", app.cmd.Yours))` — no new plumbing, `handle`/`send` already cover splitting, HTML and errors
+1. Method on `chat.Commands` with the signature `func(context.Context, Request) []Reply` — argument in `req.Text` (already stripped of the command prefix), `Reply.Message` built with `i18n.Format(req.Lang, key, spans...)` (translations stay markup-free, placeholders `%s` only). Test it in `internal/chat/command_test.go`
+2. Add whatever it needs to `chat.Domain`
+3. Register in `telegram.Adapter.Run`: `b.RegisterHandler(bot.HandlerTypeMessageText, "cmd", bot.MatchTypeCommandStartOnly, a.handle("cmd", a.cmd.Yours))` — no new plumbing, `handle`/`send` already cover formatting, splitting and errors
 4. Domain logic as a method on `Deckbox` in `internal/deckbox/handler.go` — it returns values, never formatted text
 5. New storage needed → add to `DeckboxSaver` (or `AdminStore`, if only the panel uses it) → implement in `sqlite.go` → test in `sqlite_test.go`
 
@@ -134,6 +140,7 @@ All profile/export fetches go through one shared `http.Transport` (keep-alive, 1
 | `ADMIN_ADDR`             | no       | `:8081` | Admin Panel listen address inside the container (never published to the host) |
 | `ADMIN_USER`             | no       | `admin` | Admin Panel Basic Auth user                                                   |
 | `ADMIN_PASSWORD`         | no       | —       | Admin Panel Basic Auth password; **empty disables the panel**                 |
+| `DISCORD_TOKEN`          | no       | —       | Discord bot token; empty disables Discord                                     |
 | `ADMIN_DOMAIN`           | no       | `admin.ivash.net` | Read by the Caddyfile, not the bot; the panel's public hostname     |
 
 \* Auth requires **either** `DECKBOX_LOGIN`+`DECKBOX_PASSWORD` **or** `DECKBOX_SESSION_COOKIE`. See **Configuration** above for what `Load` rejects.

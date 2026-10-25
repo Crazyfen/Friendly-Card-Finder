@@ -23,6 +23,7 @@ type Config struct {
 	AdminAddr               string
 	AdminUser               string
 	AdminPassword           string
+	DiscordToken            string // empty disables Discord
 }
 
 // defaultAdminAddr is where the Admin Panel listens inside the container. Caddy
@@ -78,8 +79,9 @@ func Load() (*Config, error) {
 		AdminAddr:               cmp.Or(env.AdminAddr.GetValue(), defaultAdminAddr),
 		AdminUser:               env.AdminUser.GetValue(), // default lives in admin.New
 		AdminPassword:           env.AdminPassword.GetValue(),
+		DiscordToken:            env.DiscordToken.GetValue(),
 		StoragePath:             storagePath,
-		BotToken:                env.BotToken.GetValue(),
+		BotToken:               env.BotToken.GetValue(),
 		Env:                     env.Env.GetValue(),
 		DeckboxSessionCookie:    deckboxSessionCookie,
 		DeckboxLogin:            deckboxLogin,

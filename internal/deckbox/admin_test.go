@@ -79,11 +79,11 @@ func TestUnlinkLeavesTheCollection(t *testing.T) {
 	store := &fakeAdmin{}
 	d := newTestDeckboxAdmin(store)
 
-	if err := d.Unlink(ctx, "petya"); err != nil {
+	if err := d.Unlink(ctx, PlatformDiscord, 9); err != nil {
 		t.Fatalf("unlink failed: %v", err)
 	}
-	if store.unlinkedLogin != "petya" {
-		t.Errorf("expected petya to be unlinked, got %q", store.unlinkedLogin)
+	if store.unlinkedPlatform != PlatformDiscord || store.unlinkedID != 9 {
+		t.Errorf("expected (discord, 9) to be unlinked, got (%q, %d)", store.unlinkedPlatform, store.unlinkedID)
 	}
 	if store.purgedLogin != "" {
 		t.Errorf("unlink must not purge, purged %q", store.purgedLogin)

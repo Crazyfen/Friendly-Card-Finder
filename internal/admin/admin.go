@@ -15,6 +15,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -30,7 +31,7 @@ type Service interface {
 	AdminUsers(ctx context.Context) ([]deckbox.AdminUser, error)
 	AdminInsights(ctx context.Context) (deckbox.Insights, error)
 	Purge(ctx context.Context, login string) (deckbox.PurgeResult, error)
-	Unlink(ctx context.Context, login string) error
+	Unlink(ctx context.Context, platform deckbox.Platform, userID int64) error
 	RefreshNow(ctx context.Context, login string) error
 }
 
@@ -230,17 +231,22 @@ func (s *Server) handlePurge(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleUnlink(w http.ResponseWriter, r *http.Request) {
-	login := strings.TrimSpace(r.FormValue("login"))
-	if login == "" {
-		s.redirect(w, r, "no login given")
+	platform := deckbox.Platform(r.FormValue("platform"))
+	if platform != deckbox.PlatformTelegram && platform != deckbox.PlatformDiscord {
+		s.redirect(w, r, "unknown platform")
+		return
+	}
+	userID, err := strconv.ParseInt(r.FormValue("userId"), 10, 64)
+	if err != nil {
+		s.redirect(w, r, "invalid user id")
 		return
 	}
 
-	if err := s.svc.Unlink(r.Context(), login); err != nil {
-		s.redirect(w, r, fmt.Sprintf("unlink %s failed: %v", login, err))
+	if err := s.svc.Unlink(r.Context(), platform, userID); err != nil {
+		s.redirect(w, r, fmt.Sprintf("unlink %s %d failed: %v", platform, userID, err))
 		return
 	}
-	s.redirect(w, r, "unlinked registration for "+login)
+	s.redirect(w, r, fmt.Sprintf("unlinked %s %d", platform, userID))
 }
 
 func (s *Server) handleRefresh(w http.ResponseWriter, r *http.Request) {

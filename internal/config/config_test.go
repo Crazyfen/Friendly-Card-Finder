@@ -16,7 +16,7 @@ func setEnv(t *testing.T, vars map[env.EnvKey]string) {
 		env.BotToken, env.StoragePath, env.Env,
 		env.DeckboxLogin, env.DeckboxPassword, env.DeckboxSessionCookie,
 		env.FreshnessTimeLimitHours, env.CardListRefreshHours, env.CardListBatchSize,
-		env.AdminAddr, env.AdminUser, env.AdminPassword,
+		env.AdminAddr, env.AdminUser, env.AdminPassword, env.DiscordToken,
 	}
 	for _, k := range all {
 		t.Setenv(string(k), vars[k])
@@ -126,6 +126,28 @@ func TestLoadDefaults(t *testing.T) {
 	// on its own, which is what keeps the bot running without one.
 	if cfg.AdminPassword != "" {
 		t.Errorf("AdminPassword = %q, want empty", cfg.AdminPassword)
+	}
+}
+
+func TestDiscordTokenOptional(t *testing.T) {
+	setEnv(t, validEnv())
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("load failed without DISCORD_TOKEN: %v", err)
+	}
+	if cfg.DiscordToken != "" {
+		t.Errorf("DiscordToken = %q, want empty", cfg.DiscordToken)
+	}
+
+	vars := validEnv()
+	vars[env.DiscordToken] = "dc-token"
+	setEnv(t, vars)
+	cfg, err = Load()
+	if err != nil {
+		t.Fatalf("load failed: %v", err)
+	}
+	if cfg.DiscordToken != "dc-token" {
+		t.Errorf("DiscordToken = %q, want it carried through", cfg.DiscordToken)
 	}
 }
 

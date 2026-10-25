@@ -4,6 +4,7 @@ import (
 	"FriendlyCardFinder/internal/deckbox"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -35,8 +36,8 @@ func (f *fakeService) Purge(ctx context.Context, login string) (deckbox.PurgeRes
 	f.purged = append(f.purged, login)
 	return deckbox.PurgeResult{ListIDs: []int64{1, 2, 3}, CardRows: 12, Registration: true}, nil
 }
-func (f *fakeService) Unlink(ctx context.Context, login string) error {
-	f.unlinked = append(f.unlinked, login)
+func (f *fakeService) Unlink(ctx context.Context, platform deckbox.Platform, userID int64) error {
+	f.unlinked = append(f.unlinked, fmt.Sprintf("%s:%d", platform, userID))
 	return nil
 }
 func (f *fakeService) RefreshNow(ctx context.Context, login string) error {
@@ -195,9 +196,8 @@ func TestPurgeIsAGetConfirmationFirst(t *testing.T) {
 	// GET /purge must only describe the purge; a browser prefetch or a stray
 	// link must never delete anything.
 	login := "petya"
-	tgID := int64(7)
 	svc := &fakeService{users: []deckbox.AdminUser{{
-		DeckboxLogin: login, TelegramID: &tgID,
+		DeckboxLogin: login, Contacts: []deckbox.Contact{{Platform: deckbox.PlatformTelegram, UserID: 7}},
 		InventoryCount: 100, TradelistCount: 200, WishlistCount: 3,
 	}}}
 	h := newTestServer(t, svc)
@@ -222,9 +222,8 @@ func TestPagesRender(t *testing.T) {
 	// Template execution errors surface at render time, not compile time, so
 	// both pages get walked once with data in them.
 	tgName := "petya_tg"
-	tgID := int64(7)
 	svc := &fakeService{users: []deckbox.AdminUser{{
-		DeckboxLogin: "petya", TelegramID: &tgID, TelegramUsername: &tgName,
+		DeckboxLogin: "petya", Contacts: []deckbox.Contact{{Platform: deckbox.PlatformTelegram, UserID: 7, Handle: &tgName}},
 		InventoryCount: 1000, TradelistCount: 2000, WishlistCount: 0,
 		MissingLists: 1, LastError: "failed to fetch profile",
 	}}}
@@ -258,16 +257,35 @@ func TestUnlinkRemovesOnlyTheRegistration(t *testing.T) {
 	svc := &fakeService{}
 	h := newTestServer(t, svc)
 
-	msg := redirectMsg(t, post(t, h, "/unlink", "login=petya"))
+	msg := redirectMsg(t, post(t, h, "/unlink", "platform=discord&userId=9"))
 
-	if len(svc.unlinked) != 1 || svc.unlinked[0] != "petya" {
-		t.Fatalf("expected petya unlinked, got %v", svc.unlinked)
+	if len(svc.unlinked) != 1 || svc.unlinked[0] != "discord:9" {
+		t.Fatalf("expected (discord, 9) unlinked, got %v", svc.unlinked)
 	}
 	if len(svc.purged) != 0 {
 		t.Errorf("unlink must never purge, purged %v", svc.purged)
 	}
-	if !strings.Contains(msg, "petya") {
-		t.Errorf("expected the outcome to name the login, got %q", msg)
+	if !strings.Contains(msg, "discord") {
+		t.Errorf("expected the outcome to name the platform, got %q", msg)
+	}
+}
+
+func TestUnlinkRejectsBadInput(t *testing.T) {
+	for _, body := range []string{
+		"platform=slack&userId=9",
+		"platform=discord&userId=abc",
+		"platform=discord",
+		"userId=9",
+	} {
+		svc := &fakeService{}
+		h := newTestServer(t, svc)
+
+		if msg := redirectMsg(t, post(t, h, "/unlink", body)); msg == "" {
+			t.Errorf("%q: expected an error message", body)
+		}
+		if len(svc.unlinked) != 0 || len(svc.purged) != 0 {
+			t.Errorf("%q: nothing may be called, got unlinked %v purged %v", body, svc.unlinked, svc.purged)
+		}
 	}
 }
 
@@ -311,7 +329,7 @@ func TestRefreshAndAddShareOnePathAndDifferInWording(t *testing.T) {
 
 func TestMutatingRoutesRefuseAnEmptyLogin(t *testing.T) {
 	// An empty form field must not reach the domain as an empty login.
-	for _, path := range []string{"/purge", "/unlink", "/refresh", "/add"} {
+	for _, path := range []string{"/purge", "/refresh", "/add"} {
 		t.Run(path, func(t *testing.T) {
 			svc := &fakeService{}
 			h := newTestServer(t, svc)

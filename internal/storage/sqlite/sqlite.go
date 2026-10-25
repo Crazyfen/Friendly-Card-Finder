@@ -202,19 +202,56 @@ func (s *SQLiteStorage) RegisterUser(ctx context.Context, user deckbox.BotUser) 
 	const op = "storage.sqlite.RegisterUser"
 
 	stmt, err := s.writeStmt(ctx, `
-	INSERT INTO users(telegramId, username, deckboxLogin, created_at)
-	VALUES (?, ?, ?, ?)
+	INSERT INTO users(platform, userId, username, deckboxLogin, created_at)
+	VALUES (?, ?, NULLIF(?, ''), ?, ?)
 	`)
 	if err != nil {
 		return fmt.Errorf("%s preparing statement: %w", op, err)
 	}
 
-	_, err = stmt.Exec(user.TelegramID, user.TelegramUsername, user.DeckboxLogin, time.Now().Unix())
+	_, err = stmt.Exec(string(user.Platform), user.UserID, user.Handle, user.DeckboxLogin, time.Now().Unix())
 	if err != nil {
 		return err
 	}
 
 	return nil
+}
+
+// ContactsFor loads the claimants of the given logins in one read.
+func (s *SQLiteStorage) ContactsFor(ctx context.Context, logins []string) (map[string][]deckbox.Contact, error) {
+	const op = "storage.sqlite.ContactsFor"
+
+	contacts := make(map[string][]deckbox.Contact)
+	if len(logins) == 0 {
+		return contacts, nil
+	}
+
+	args := make([]any, len(logins))
+	for i, l := range logins {
+		args[i] = l
+	}
+	query := `SELECT deckboxLogin, platform, userId, username FROM users
+		WHERE deckboxLogin IN (?` + strings.Repeat(",?", len(logins)-1) + `)
+		ORDER BY deckboxLogin, platform, userId`
+
+	rows, err := s.db.readDB.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("%s: %w", op, err)
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var login string
+		var c deckbox.Contact
+		if err := rows.Scan(&login, &c.Platform, &c.UserID, &c.Handle); err != nil {
+			return nil, fmt.Errorf("%s: %w", op, err)
+		}
+		contacts[login] = append(contacts[login], c)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("%s: %w", op, err)
+	}
+	return contacts, nil
 }
 
 // SaveDeckboxUser stores the profile's Card List ids. A list the profile no
@@ -572,10 +609,9 @@ func (s *SQLiteStorage) SearchCard(ctx context.Context, q deckbox.Query) ([]deck
 			// quantity is stored in the FTS table, so no join back to card_lists.
 			sqlStmt := fmt.Sprintf(`
 			SELECT fts.listId, fts.cardName, fts.quantity,
-			       du.deckboxLogin, u.telegramId, u.username
+			       du.deckboxLogin
 			FROM card_lists_fts AS fts
 			JOIN deckbox_users AS du ON fts.listId = du.%s
-			LEFT JOIN users AS u ON du.deckboxLogin = u.deckboxLogin
 			WHERE fts.card_lists_fts MATCH ?
 			ORDER BY fts.listId ASC
 			`, column)
@@ -610,10 +646,9 @@ func (s *SQLiteStorage) SearchCard(ctx context.Context, q deckbox.Query) ([]deck
 		}
 		sqlStmt := fmt.Sprintf(`
 		SELECT cl.listId, cl.cardName COLLATE NOCASE, cl.quantity,
-		       du.deckboxLogin, u.telegramId, u.username
+		       du.deckboxLogin
 		FROM card_lists AS cl
 		JOIN deckbox_users AS du ON cl.listId = du.%s
-		LEFT JOIN users AS u ON du.deckboxLogin = u.deckboxLogin
 		WHERE %s
 		ORDER BY cl.listId ASC
 		`, column, predicate)
@@ -640,9 +675,7 @@ func (s *SQLiteStorage) SearchCard(ctx context.Context, q deckbox.Query) ([]deck
 		var rowCardName string
 		var quantity int16
 		var deckboxLogin string
-		var telegramId *int64
-		var username *string
-		err := rows.Scan(&listId, &rowCardName, &quantity, &deckboxLogin, &telegramId, &username)
+		err := rows.Scan(&listId, &rowCardName, &quantity, &deckboxLogin)
 		if err != nil {
 			return nil, fmt.Errorf("%s: %w", op, err)
 		}
@@ -657,9 +690,7 @@ func (s *SQLiteStorage) SearchCard(ctx context.Context, q deckbox.Query) ([]deck
 		if current == nil || current.ListId != listId {
 			results = append(results, deckbox.CardListWithOwner{
 				CardList:         deckbox.CardList{ListId: listId, Cards: make(map[string]int16)},
-				DeckboxLogin:     deckboxLogin,
-				TelegramID:       telegramId,
-				TelegramUsername: username,
+				DeckboxLogin: deckboxLogin,
 			})
 			current = &results[len(results)-1]
 		}
