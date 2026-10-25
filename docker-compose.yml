@@ -14,9 +14,12 @@ services:
     image: caddy:alpine
     restart: unless-stopped
     env_file: .env
+    # The host's nginx owns :80 and xray owns :443. Port 80 is reached only
+    # through nginx, which forwards admin.ivash.net's ACME HTTP-01 challenge
+    # here; the panel itself is served on :8443.
     ports:
-      - "80:80"
-      - "443:443"
+      - "127.0.0.1:8088:80"
+      - "8443:8443"
     volumes:
       - ./Caddyfile:/etc/caddy/Caddyfile:ro
       - caddy_data:/data
